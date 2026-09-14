@@ -53,13 +53,13 @@ All times at the tool boundary are in **seconds** (converted to CapCut's microse
 | `capcut_list_drafts` | list drafts + duration + lock status |
 | `capcut_read_timeline` | full read: canvas, fps, tracks, every segment (reflects pending session edits) |
 | `capcut_clone_draft` | copy a draft (optionally emptied) for a fresh build |
-| `capcut_add_video / _image / _audio` | place media at a time on a track |
-| `capcut_add_text` | text overlay (needs a text template draft) |
+| `capcut_add_video / _image / _audio` | place media on a track. Omit `atSec` to append right after the last clip on that track — no running-total math needed for a sequence of clips |
+| `capcut_add_text` | text overlay (needs a text template draft). Omit `atSec` to append too |
 | `capcut_add_track` | new video/audio/text/sticker track |
 | `capcut_move_segment` | change start time / track |
-| `capcut_trim_segment` | change start / duration / source in-point |
+| `capcut_trim_segment` | change start / duration / source in-point. `ripple:true` shifts every later segment by the resulting time change instead of leaving a gap or overlap (`rippleAllTracks:true` to shift every track, not just this one) |
 | `capcut_split_segment` | split at a time |
-| `capcut_delete_segment` | remove |
+| `capcut_delete_segment` | remove. `ripple:true` shifts later segments earlier to close the gap (`rippleAllTracks:true` for every track) |
 | `capcut_set_props` | scale / position / rotation / opacity / volume / speed / visibility (static value for the whole segment) |
 | `capcut_list_filters` / `capcut_list_transitions` / `capcut_list_masks` | search the bundled real-CapCut catalog by name |
 | `capcut_add_filter` | attach a real filter (from the catalog) to a segment, with optional intensity |

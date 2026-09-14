@@ -43,10 +43,17 @@ edits. `capcut_save` refuses when CapCut is running or the draft's `.locked` fil
      or burn them in HyperFrames if you want styled/animated captions.
    - Use **ffprobe** to confirm each asset's duration before placing it so timings line up.
 4. **Assemble in the draft (session edits accumulate in memory):**
-   - `capcut_add_video` / `_image` / `_audio` — place media at `atSec` on a track.
+   - `capcut_add_video` / `_image` / `_audio` — place media on a track. **Omit `atSec`** when clips
+     play back-to-back — it appends right after the last clip on that track, so you never have to
+     sum up durations yourself. Only pass `atSec` for a deliberate gap or overlap.
    - `capcut_add_text` — captions/titles (needs a text-template draft; see `CAPCUT_TEMPLATE_DRAFT`).
+     Same append-by-default rule.
    - `capcut_add_track` — separate layers for b-roll, captions, music.
    - `capcut_move_segment` / `_trim_segment` / `_split_segment` / `_delete_segment` — re-cut and retime.
+     **Pass `ripple:true`** on trim/delete whenever the edit should behave like a real cut (close the
+     gap, push everything after it) rather than leaving dead space — this is almost always what "cut
+     the boring part" or "make this clip shorter" means. Add `rippleAllTracks:true` if other tracks
+     (music, captions) must stay in sync with the ripple too; leave it off to ripple just one track.
    - `capcut_set_props` — scale, position, rotation, opacity, volume, speed, visibility (static value).
    - `capcut_add_keyframe` / `_remove_keyframes` — real per-property animation (Ken Burns zooms, fades,
      eased moves) instead of a static value; call it twice with different `atSec`/`value` on the same
@@ -64,6 +71,28 @@ edits. `capcut_save` refuses when CapCut is running or the draft's `.locked` fil
    if the draft changed on disk since this session loaded it — pass `force:true` only if you mean it).
    Use `capcut_undo` to step back one edit, or `capcut_discard` to drop the whole unsaved session.
 6. **Reopen in CapCut** to review, then export from the app (or encode the assembled pieces with ffmpeg).
+
+## How to plan a multi-step edit
+
+Don't fire tool calls one at a time as they occur to you — a real edit is a short plan, executed in
+an order that doesn't fight itself:
+
+1. **Read first.** `capcut_read_timeline` before touching anything, even on a draft you just built —
+   it reflects this session's pending edits too, so it's always the source of truth for segment ids
+   and current timings.
+2. **Cuts before adds, ripple as you go.** If the request mixes removing/shortening footage with
+   adding new material ("cut the dead air, then add a caption over the result"), do the cuts first
+   with `ripple:true` so later timestamps are already correct when you place the new material —
+   otherwise you're computing offsets against a timeline that's about to shift under you.
+3. **Sequence additions with append, not arithmetic.** When placing N clips/captions in order, omit
+   `atSec` on each one instead of tracking a running total by hand — that's exactly the class of
+   mistake (off-by-one timing, drift after an edit) manual math invites.
+4. **Batch, then validate once.** Make all the related edits for one request, then run
+   `capcut_validate` and read `issues`/`warnings` before `capcut_save` — don't save after every single
+   tool call. `capcut_undo` recovers from one bad step without discarding the whole batch.
+5. **Re-read after anything surprising.** If a tool result doesn't match your mental model of the
+   timeline (wrong duration, unexpected overlap), `capcut_read_timeline` again rather than guessing —
+   it's cheap and it's authoritative.
 
 ## Tips & gotchas
 - **Seconds in, seconds out.** The MCP converts to CapCut's microseconds internally — never pass µs.

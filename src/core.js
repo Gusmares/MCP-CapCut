@@ -135,6 +135,8 @@ export class CapCutDraft {
   }
   _mats(key) { this.content.materials[key] = this.content.materials[key] || []; return this.content.materials[key]; }
   _nextRender() { let m = -1; for (const tr of this.content.tracks) for (const s of (tr.segments || [])) { const ri = s.render_index || 0; if (ri > m) m = ri; } return m + 1; }
+  // end time (us) of the last segment on a track, i.e. where the next clip should go to play back-to-back
+  _trackEnd(track) { let end = 0; for (const s of (track.segments || [])) end = Math.max(end, s.target_timerange.start + s.target_timerange.duration); return end; }
 
   // ---------- read ----------
   timeline() {
@@ -189,16 +191,16 @@ export class CapCutDraft {
     this._mats(matKey).push(mat);
     const refs = tpl.refs.filter(({ k }) => SAFE_TEMPLATE_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
     const seg = clone(tpl.seg); seg.id = uid(); seg.material_id = mat.id; seg.extra_material_refs = refs;
-    const at = opts.atUs || 0;
+    const track = this._resolveTrack(opts, kind === 'audio' ? 'audio' : 'video');
+    const at = opts.atUs != null ? opts.atUs : this._trackEnd(track); // omit atSec to append right after the last clip on this track
     seg.target_timerange = { start: at, duration: dur };
     seg.source_timerange = { start: opts.srcStartUs || 0, duration: dur };
     this._applyProps(seg, opts);
     seg.render_index = this._nextRender();
-    const track = this._resolveTrack(opts, kind === 'audio' ? 'audio' : 'video');
     seg.track_render_index = opts.trackRenderIndex != null ? opts.trackRenderIndex : (this.content.tracks.indexOf(track));
     track.segments.push(seg);
     this.content.duration = Math.max(this.content.duration || 0, at + dur);
-    return { segmentId: seg.id, endUs: at + dur };
+    return { segmentId: seg.id, atSec: at / US, endUs: at + dur };
   }
   addVideo(file, opts = {}) { return this._addMedia('video', file, opts); }
   addImage(file, opts = {}) { return this._addMedia('image', file, opts); }
@@ -223,16 +225,17 @@ export class CapCutDraft {
     this._mats('texts').push(mat);
     const refs = tpl.refs.filter(({ k }) => SAFE_TEMPLATE_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
     const seg = clone(tpl.seg); seg.id = uid(); seg.material_id = mat.id; seg.extra_material_refs = refs;
-    const at = opts.atUs || 0, dur = opts.durUs || 3 * US;
+    const dur = opts.durUs || 3 * US;
+    const track = this._resolveTrack(opts, 'text');
+    const at = opts.atUs != null ? opts.atUs : this._trackEnd(track); // omit atSec to append right after the last text on this track
     seg.target_timerange = { start: at, duration: dur };
     seg.source_timerange = { start: 0, duration: dur };
     this._applyProps(seg, opts);
     seg.render_index = this._nextRender();
-    const track = this._resolveTrack(opts, 'text');
     seg.track_render_index = opts.trackRenderIndex != null ? opts.trackRenderIndex : this.content.tracks.indexOf(track);
     track.segments.push(seg);
     this.content.duration = Math.max(this.content.duration || 0, at + dur);
-    return { segmentId: seg.id, endUs: at + dur };
+    return { segmentId: seg.id, atSec: at / US, endUs: at + dur };
   }
 
   // ---------- edit existing segments ----------
@@ -244,13 +247,24 @@ export class CapCutDraft {
     if (newTrackIndex != null && this.content.tracks[newTrackIndex]) { tr.segments = tr.segments.filter(x => x.id !== segId); this.content.tracks[newTrackIndex].segments.push(s); }
     this._recalcDuration(); return { segmentId: segId, atSec: atUs / US, durSec: dur / US };
   }
-  trimSegment(segId, { atUs, durUs, srcStartUs } = {}) {
+  trimSegment(segId, { atUs, durUs, srcStartUs, ripple, rippleAllTracks } = {}) {
     this._pushUndo();
-    const { s } = this._find(segId);
+    const { tr, s } = this._find(segId);
+    const oldEnd = s.target_timerange.start + s.target_timerange.duration;
     if (atUs != null) s.target_timerange.start = atUs;
     if (durUs != null) { s.target_timerange.duration = durUs; s.source_timerange.duration = durUs; }
     if (srcStartUs != null) s.source_timerange.start = srcStartUs;
-    this._recalcDuration(); return { segmentId: segId };
+    const newEnd = s.target_timerange.start + s.target_timerange.duration;
+    const delta = newEnd - oldEnd;
+    if (ripple && delta !== 0) this._rippleShift(oldEnd, delta, segId, rippleAllTracks ? this.content.tracks : [tr]);
+    this._recalcDuration(); return { segmentId: segId, rippled: !!ripple, shiftedByS: delta / US };
+  }
+  // shift every segment starting at/after `fromUs` (except `exceptId`) by `deltaUs`, across the given tracks
+  _rippleShift(fromUs, deltaUs, exceptId, tracks) {
+    for (const t of tracks) for (const seg of (t.segments || [])) {
+      if (seg.id === exceptId) continue;
+      if (seg.target_timerange.start >= fromUs) seg.target_timerange.start += deltaUs;
+    }
   }
   splitSegment(segId, atUs) {
     this._pushUndo();
@@ -268,7 +282,15 @@ export class CapCutDraft {
     tr.segments.push(right);
     return { left: segId, right: right.id };
   }
-  deleteSegment(segId) { this._pushUndo(); const { tr } = this._find(segId); tr.segments = tr.segments.filter(x => x.id !== segId); this._recalcDuration(); return { deleted: segId }; }
+  deleteSegment(segId, { ripple, rippleAllTracks } = {}) {
+    this._pushUndo();
+    const { tr, s } = this._find(segId);
+    const start = s.target_timerange.start, dur = s.target_timerange.duration;
+    tr.segments = tr.segments.filter(x => x.id !== segId);
+    if (ripple) this._rippleShift(start + dur, -dur, segId, rippleAllTracks ? this.content.tracks : [tr]);
+    this._recalcDuration();
+    return { deleted: segId, rippled: !!ripple };
+  }
   setProps(segId, props = {}) { this._pushUndo(); const { s } = this._find(segId); this._applyProps(s, props); return { segmentId: segId, applied: Object.keys(props) }; }
   _applyProps(seg, p) {
     seg.clip = seg.clip || { alpha: 1, flip: { horizontal: false, vertical: false }, rotation: 0, scale: { x: 1, y: 1 }, transform: { x: 0, y: 0 } };
@@ -414,7 +436,9 @@ export class CapCutDraft {
     this._pushUndo();
     const mat = { id: uid(), type: 'sticker', resource_id: resourceId, sticker_id: resourceId, source_platform: 1 };
     this._mats('stickers').push(mat);
-    const at = opts.atUs || 0, dur = opts.durUs || 3 * US;
+    const dur = opts.durUs || 3 * US;
+    const track = this._resolveTrack(opts, 'sticker');
+    const at = opts.atUs != null ? opts.atUs : this._trackEnd(track); // omit atSec to append right after the last sticker on this track
     const seg = {
       id: uid(), material_id: mat.id,
       target_timerange: { start: at, duration: dur }, source_timerange: null,
@@ -425,11 +449,10 @@ export class CapCutDraft {
     };
     this._applyProps(seg, opts);
     seg.render_index = this._nextRender();
-    const track = this._resolveTrack(opts, 'sticker');
     seg.track_render_index = opts.trackRenderIndex != null ? opts.trackRenderIndex : this.content.tracks.indexOf(track);
     track.segments.push(seg);
     this.content.duration = Math.max(this.content.duration || 0, at + dur);
-    return { segmentId: seg.id, endUs: at + dur };
+    return { segmentId: seg.id, atSec: at / US, endUs: at + dur };
   }
 
   // ---------- validate ----------

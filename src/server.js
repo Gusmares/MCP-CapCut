@@ -19,7 +19,7 @@ const sec = v => v == null ? undefined : Math.round(v * US);
 
 // media-placement option shape shared by add_video/image/audio
 const placeOpts = {
-  atSec: z.number().describe('start time on the timeline, seconds'),
+  atSec: z.number().optional().describe('start time on the timeline, seconds. Omit to append right after the last clip on the target track (no manual running-total math needed).'),
   durSec: z.number().optional().describe('duration (default: full media length)'),
   srcStartSec: z.number().optional().describe('in-point inside the source file, seconds'),
   trackIndex: z.number().int().optional().describe('target track (index in the tracks list); a new track is made if omitted'),
@@ -63,7 +63,7 @@ s.tool('capcut_add_audio', 'Add an audio clip at a time on a track.',
   wrap(async (a) => get(a.draft).addAudio(a.file, optsFrom(a))));
 
 s.tool('capcut_add_text', 'Add a text overlay. Requires a text template (a draft with a text layer; see CAPCUT_TEMPLATE_DRAFT).',
-  { draft: z.string(), text: z.string(), atSec: z.number(), durSec: z.number().optional(),
+  { draft: z.string(), text: z.string(), atSec: z.number().optional().describe('omit to append right after the last text on the target track'), durSec: z.number().optional(),
     fontSize: z.number().optional(), color: z.string().optional().describe('hex e.g. #ffffff'),
     posX: z.number().optional(), posY: z.number().optional(), trackIndex: z.number().int().optional() },
   wrap(async (a) => get(a.draft).addText(a.text, { atUs: sec(a.atSec), durUs: sec(a.durSec), fontSize: a.fontSize, color: a.color, posX: a.posX, posY: a.posY, trackIndex: a.trackIndex })));
@@ -76,16 +76,18 @@ s.tool('capcut_move_segment', 'Move a segment to a new start time and optionally
   { draft: z.string(), segmentId: z.string(), atSec: z.number(), trackIndex: z.number().int().optional() },
   wrap(async ({ draft, segmentId, atSec, trackIndex }) => get(draft).moveSegment(segmentId, sec(atSec), trackIndex)));
 
-s.tool('capcut_trim_segment', 'Change a segment start / duration / source in-point (seconds).',
-  { draft: z.string(), segmentId: z.string(), atSec: z.number().optional(), durSec: z.number().optional(), srcStartSec: z.number().optional() },
-  wrap(async ({ draft, segmentId, atSec, durSec, srcStartSec }) => get(draft).trimSegment(segmentId, { atUs: sec(atSec), durUs: sec(durSec), srcStartUs: sec(srcStartSec) })));
+s.tool('capcut_trim_segment', 'Change a segment start / duration / source in-point (seconds). With ripple:true, every later segment (on this track, or every track if rippleAllTracks:true) shifts by the resulting time change instead of leaving a gap or an overlap.',
+  { draft: z.string(), segmentId: z.string(), atSec: z.number().optional(), durSec: z.number().optional(), srcStartSec: z.number().optional(),
+    ripple: z.boolean().optional(), rippleAllTracks: z.boolean().optional() },
+  wrap(async ({ draft, segmentId, atSec, durSec, srcStartSec, ripple, rippleAllTracks }) => get(draft).trimSegment(segmentId, { atUs: sec(atSec), durUs: sec(durSec), srcStartUs: sec(srcStartSec), ripple, rippleAllTracks })));
 
 s.tool('capcut_split_segment', 'Split a segment into two at a timeline time.',
   { draft: z.string(), segmentId: z.string(), atSec: z.number() },
   wrap(async ({ draft, segmentId, atSec }) => get(draft).splitSegment(segmentId, sec(atSec))));
 
-s.tool('capcut_delete_segment', 'Remove a segment.',
-  { draft: z.string(), segmentId: z.string() }, wrap(async ({ draft, segmentId }) => get(draft).deleteSegment(segmentId)));
+s.tool('capcut_delete_segment', 'Remove a segment. With ripple:true, every later segment (on this track, or every track if rippleAllTracks:true) shifts earlier to close the gap instead of leaving dead space.',
+  { draft: z.string(), segmentId: z.string(), ripple: z.boolean().optional(), rippleAllTracks: z.boolean().optional() },
+  wrap(async ({ draft, segmentId, ripple, rippleAllTracks }) => get(draft).deleteSegment(segmentId, { ripple, rippleAllTracks })));
 
 s.tool('capcut_set_props', 'Set transform / opacity / volume / speed / visibility on a segment.',
   { draft: z.string(), segmentId: z.string(), scale: z.number().optional(), scaleX: z.number().optional(), scaleY: z.number().optional(),
