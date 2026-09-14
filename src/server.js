@@ -33,8 +33,8 @@ const s = new McpServer({ name: 'capcut', version: '0.1.0' });
 
 s.tool('capcut_list_drafts', `List CapCut drafts in ${DRAFTS_DIR} with duration and lock status.`, {}, wrap(async () => ({ draftsDir: DRAFTS_DIR, drafts: listDrafts() })));
 
-s.tool('capcut_read_timeline', 'Read a draft: canvas, fps, tracks and every segment (id, media, times, layer). Read-only.',
-  { draft: z.string() }, wrap(async ({ draft }) => new CapCutDraft(draft).timeline()));
+s.tool('capcut_read_timeline', 'Read a draft: canvas, fps, tracks and every segment (id, media, times, layer). Reflects any pending unsaved edits from this session.',
+  { draft: z.string() }, wrap(async ({ draft }) => get(draft).timeline()));
 
 s.tool('capcut_clone_draft', 'Copy a draft folder to a new name (valid scaffolding). empty:true clears all clips/tracks for a fresh build.',
   { base: z.string(), newName: z.string(), empty: z.boolean().optional() },

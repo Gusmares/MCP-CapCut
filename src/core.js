@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 
 // ---- where the drafts live (override with CAPCUT_DRAFTS_DIR) ----
 const STD_WIN = path.join(os.homedir(), 'AppData/Local/CapCut/User Data/Projects/com.lveditor.draft');
@@ -22,16 +22,25 @@ export const DRAFTS_DIR =
 // a draft known to contain video/text/audio layers, used to harvest templates
 const TEMPLATE_DRAFT = process.env.CAPCUT_TEMPLATE_DRAFT || '0723';
 
+// resolve a draft name to a path guaranteed to stay inside DRAFTS_DIR (blocks '..' and absolute-path traversal)
+function safeDraftPath(name) {
+  if (typeof name !== 'string' || !name) throw new Error(`invalid draft name: ${JSON.stringify(name)}`);
+  const base = path.resolve(DRAFTS_DIR);
+  const resolved = path.resolve(base, name);
+  if (resolved !== base && !resolved.startsWith(base + path.sep)) throw new Error(`invalid draft name: ${name} (must stay inside ${DRAFTS_DIR})`);
+  return resolved;
+}
+
 const uid = () => crypto.randomUUID().toUpperCase();
 const clone = o => JSON.parse(JSON.stringify(o));
 const US = 1e6;
 
 function probeDur(file) {
-  try { return Math.round(parseFloat(execSync(`ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "${file}"`).toString().trim()) * US); }
+  try { return Math.round(parseFloat(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file]).toString().trim()) * US); }
   catch { return 5 * US; }
 }
 function probeWH(file) {
-  try { const [w, h] = execSync(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "${file}"`).toString().trim().split('x').map(Number); return { w: w || 1920, h: h || 1080 }; }
+  try { const [w, h] = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x', file]).toString().trim().split('x').map(Number); return { w: w || 1920, h: h || 1080 }; }
   catch { return { w: 1920, h: 1080 }; }
 }
 
@@ -79,9 +88,11 @@ function capcutRunning() {
 export class CapCutDraft {
   constructor(name) {
     this.name = name;
-    this.dir = path.join(DRAFTS_DIR, name);
-    if (!fs.existsSync(path.join(this.dir, 'draft_content.json'))) throw new Error(`draft not found: ${name} (in ${DRAFTS_DIR})`);
-    this.content = JSON.parse(fs.readFileSync(path.join(this.dir, 'draft_content.json'), 'utf8'));
+    this.dir = safeDraftPath(name);
+    this.contentPath = path.join(this.dir, 'draft_content.json');
+    if (!fs.existsSync(this.contentPath)) throw new Error(`draft not found: ${name} (in ${DRAFTS_DIR})`);
+    this.content = JSON.parse(fs.readFileSync(this.contentPath, 'utf8'));
+    this._loadedMtimeMs = fs.statSync(this.contentPath).mtimeMs;
     this.metaPath = path.join(this.dir, 'draft_meta_info.json');
     this.meta = fs.existsSync(this.metaPath) ? JSON.parse(fs.readFileSync(this.metaPath, 'utf8')) : null;
     this._tpl = null;
@@ -99,7 +110,7 @@ export class CapCutDraft {
     this._tpl = t; return t;
   }
   _mats(key) { this.content.materials[key] = this.content.materials[key] || []; return this.content.materials[key]; }
-  _nextRender() { let m = -1; for (const tr of this.content.tracks) for (const s of (tr.segments || [])) if ((s.render_index || 0) > m) m = s.render_index; return m + 1; }
+  _nextRender() { let m = -1; for (const tr of this.content.tracks) for (const s of (tr.segments || [])) { const ri = s.render_index || 0; if (ri > m) m = ri; } return m + 1; }
 
   // ---------- read ----------
   timeline() {
@@ -146,7 +157,7 @@ export class CapCutDraft {
     const dur = opts.durUs != null ? opts.durUs : probeDur(file);
     const mat = clone(tpl.mat); mat.id = uid(); mat.path = file.replace(/\\/g, '/'); mat.material_name = path.basename(file); mat.type = type;
     if (kind !== 'audio') { const { w, h } = probeWH(file); mat.width = w; mat.height = h; }
-    mat.duration = kind === 'audio' ? probeDur(file) : (mat.duration || probeDur(file));
+    mat.duration = probeDur(file); // always the real file's own duration, never the cloned template's stale value
     ['local_material_id', 'origin_material_id', 'local_id', 'request_id', 'aigc_history_id', 'aigc_item_id'].forEach(k => { if (k in mat) mat[k] = ''; });
     const matKey = kind === 'audio' ? 'audios' : (kind === 'image' ? 'videos' : 'videos'); // CapCut stores images in videos[]
     this._mats(matKey).push(mat);
@@ -275,23 +286,30 @@ export class CapCutDraft {
     if (!force) {
       if (fs.existsSync(path.join(this.dir, '.locked'))) throw new Error('draft is locked (open in CapCut). Close CapCut, or pass force:true. Autosave will overwrite edits made while open.');
       if (capcutRunning()) throw new Error('CapCut is running. Close it before saving, or pass force:true.');
+      let onDiskMtimeMs; try { onDiskMtimeMs = fs.statSync(this.contentPath).mtimeMs; } catch {}
+      if (onDiskMtimeMs != null && onDiskMtimeMs !== this._loadedMtimeMs) throw new Error('draft was modified on disk since this session loaded it (edited elsewhere, e.g. in CapCut). Discard this session and start over, or pass force:true to overwrite those changes.');
     }
     const v = this.validate();
-    const cPath = path.join(this.dir, 'draft_content.json');
+    if (!v.ok && !force) throw new Error(`refusing to save: ${v.issues.join('; ')} (fix the issues, or pass force:true to save anyway)`);
+    const cPath = this.contentPath;
     try { fs.copyFileSync(cPath, cPath + '.mcpbak'); } catch {}
     const tmp = cPath + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(this.content)); fs.renameSync(tmp, cPath);
     if (this.meta) { try { fs.copyFileSync(this.metaPath, this.metaPath + '.mcpbak'); } catch {} const mt = this.metaPath + '.tmp'; fs.writeFileSync(mt, JSON.stringify(this.meta)); fs.renameSync(mt, this.metaPath); }
+    this._loadedMtimeMs = fs.statSync(cPath).mtimeMs;
     return { saved: this.name, durationSec: +(this.content.duration / US).toFixed(3), validation: v };
   }
 }
 
 // clone a whole draft folder to a new name (valid scaffolding), optionally emptied
 export function cloneDraft(base, newName, { empty = false } = {}) {
-  const src = path.join(DRAFTS_DIR, base), dst = path.join(DRAFTS_DIR, newName);
+  const src = safeDraftPath(base), dst = safeDraftPath(newName);
   if (!fs.existsSync(path.join(src, 'draft_content.json'))) throw new Error(`base draft not found: ${base}`);
   if (fs.existsSync(dst)) throw new Error(`draft already exists: ${newName}`);
   fs.mkdirSync(dst, { recursive: true });
-  for (const fn of fs.readdirSync(src)) { const s = path.join(src, fn); try { if (fs.statSync(s).isFile()) fs.copyFileSync(s, path.join(dst, fn)); } catch {} }
+  for (const fn of fs.readdirSync(src)) {
+    if (fn === '.locked' || fn.endsWith('.mcpbak') || fn.endsWith('.tmp')) continue; // don't propagate this tool's own sentinel/backup files
+    const s = path.join(src, fn); try { if (fs.statSync(s).isFile()) fs.copyFileSync(s, path.join(dst, fn)); } catch {}
+  }
   if (empty) {
     const d = new CapCutDraft(newName);
     for (const k of Object.keys(d.content.materials)) if (Array.isArray(d.content.materials[k])) d.content.materials[k] = [];
