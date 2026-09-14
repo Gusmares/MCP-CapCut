@@ -5,7 +5,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { CapCutDraft, cloneDraft, listDrafts, DRAFTS_DIR } from './core.js';
+import { CapCutDraft, cloneDraft, listDrafts, DRAFTS_DIR, FILTERS, TRANSITIONS, MASKS, searchCatalog } from './core.js';
+
+const KEYFRAME_PROPERTIES = ['KFTypePositionX', 'KFTypePositionY', 'KFTypeRotation', 'KFTypeScaleX', 'KFTypeScaleY', 'UNIFORM_SCALE', 'KFTypeAlpha', 'KFTypeSaturation', 'KFTypeContrast', 'KFTypeBrightness', 'KFTypeVolume'];
 
 const US = 1e6;
 const open = new Map();                       // name -> live CapCutDraft (unsaved edits)
@@ -32,6 +34,14 @@ const optsFrom = a => ({ atUs: sec(a.atSec), durUs: sec(a.durSec), srcStartUs: s
 const s = new McpServer({ name: 'capcut', version: '0.1.0' });
 
 s.tool('capcut_list_drafts', `List CapCut drafts in ${DRAFTS_DIR} with duration and lock status.`, {}, wrap(async () => ({ draftsDir: DRAFTS_DIR, drafts: listDrafts() })));
+
+s.tool('capcut_list_filters', `Search the bundled catalog of ${FILTERS.length} real CapCut filters by name (case/space-insensitive substring). Omit query to see the first matches.`,
+  { query: z.string().optional() }, wrap(async ({ query }) => ({ total: FILTERS.length, matches: searchCatalog(FILTERS, query) })));
+
+s.tool('capcut_list_transitions', `Search the bundled catalog of ${TRANSITIONS.length} real CapCut transitions by name (case/space-insensitive substring). Omit query to see the first matches.`,
+  { query: z.string().optional() }, wrap(async ({ query }) => ({ total: TRANSITIONS.length, matches: searchCatalog(TRANSITIONS, query) })));
+
+s.tool('capcut_list_masks', `List the ${MASKS.length} available mask shapes.`, {}, wrap(async () => ({ masks: MASKS.map(m => m.name) })));
 
 s.tool('capcut_read_timeline', 'Read a draft: canvas, fps, tracks and every segment (id, media, times, layer). Reflects any pending unsaved edits from this session.',
   { draft: z.string() }, wrap(async ({ draft }) => get(draft).timeline()));
@@ -82,6 +92,39 @@ s.tool('capcut_set_props', 'Set transform / opacity / volume / speed / visibilit
     posX: z.number().optional(), posY: z.number().optional(), rotation: z.number().optional(), opacity: z.number().optional(),
     volume: z.number().optional(), speed: z.number().optional(), visible: z.boolean().optional() },
   wrap(async (a) => get(a.draft).setProps(a.segmentId, a)));
+
+s.tool('capcut_add_filter', 'Attach a real CapCut filter (from capcut_list_filters) to a segment, replacing any filter already on it. intensity is 0-1 (default: the filter\'s own default).',
+  { draft: z.string(), segmentId: z.string(), name: z.string(), intensity: z.number().min(0).max(1).optional() },
+  wrap(async ({ draft, segmentId, name, intensity }) => get(draft).addFilter(segmentId, name, intensity)));
+
+s.tool('capcut_add_transition', 'Attach a real CapCut transition (from capcut_list_transitions) on this segment, applied between it and whichever segment follows immediately on the same track.',
+  { draft: z.string(), segmentId: z.string(), name: z.string(), durationSec: z.number().optional().describe('default: the transition\'s own default duration') },
+  wrap(async ({ draft, segmentId, name, durationSec }) => get(draft).addTransition(segmentId, name, sec(durationSec))));
+
+s.tool('capcut_add_mask', 'Attach a mask shape (from capcut_list_masks) to a segment, replacing any mask already on it. center/width/height/rotation/feather/roundCorner are fractions (0-1) unless noted.',
+  { draft: z.string(), segmentId: z.string(), name: z.string(), centerX: z.number().optional(), centerY: z.number().optional(),
+    width: z.number().optional(), height: z.number().optional(), rotation: z.number().optional(),
+    feather: z.number().min(0).max(1).optional(), roundCorner: z.number().min(0).max(1).optional(), invert: z.boolean().optional() },
+  wrap(async ({ draft, segmentId, name, ...opts }) => get(draft).addMask(segmentId, name, opts)));
+
+s.tool('capcut_add_keyframe', `Add/replace a keyframe on a segment property at a time, creating real per-property animation (not a static value). Call twice with different atSec/value on the same property to animate between them. property must be one of: ${KEYFRAME_PROPERTIES.join(', ')}.`,
+  { draft: z.string(), segmentId: z.string(), property: z.enum(KEYFRAME_PROPERTIES), atSec: z.number(), value: z.number() },
+  wrap(async ({ draft, segmentId, property, atSec, value }) => get(draft).addKeyframe(segmentId, property, sec(atSec), value)));
+
+s.tool('capcut_remove_keyframes', 'Remove all keyframes for one property on a segment (it reverts to a static value from clip/set_props).',
+  { draft: z.string(), segmentId: z.string(), property: z.enum(KEYFRAME_PROPERTIES) },
+  wrap(async ({ draft, segmentId, property }) => get(draft).removeKeyframes(segmentId, property)));
+
+s.tool('capcut_add_audio_fade', 'Set fade-in/fade-out duration on an audio (or audio-carrying) segment. Omit either to leave it unchanged.',
+  { draft: z.string(), segmentId: z.string(), fadeInSec: z.number().optional(), fadeOutSec: z.number().optional() },
+  wrap(async ({ draft, segmentId, fadeInSec, fadeOutSec }) => get(draft).addAudioFade(segmentId, { fadeInUs: sec(fadeInSec), fadeOutUs: sec(fadeOutSec) })));
+
+s.tool('capcut_add_sticker', 'Add a sticker by CapCut resource_id (get one by inspecting a draft where you or the user already placed that sticker once -- there is no bundled sticker catalog, CapCut\'s sticker library is too large/volatile to ship). Placed on a new or existing sticker track.',
+  { draft: z.string(), resourceId: z.string(), ...placeOpts },
+  wrap(async ({ draft, resourceId, ...a }) => get(draft).addSticker(resourceId, optsFrom(a))));
+
+s.tool('capcut_undo', 'Undo the last edit in this session (up to 20 steps back). Does not affect anything already saved to disk.',
+  { draft: z.string() }, wrap(async ({ draft }) => get(draft).undo()));
 
 s.tool('capcut_raw_patch', 'Advanced escape hatch: deep-merge a JSON patch into draft_content (undocumented ops). Use with care.',
   { draft: z.string(), patch: z.record(z.any()) }, wrap(async ({ draft, patch }) => get(draft).rawPatch(patch)));

@@ -5,6 +5,30 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { execSync, execFileSync } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// bundled catalogs (real resource_id/effect_id pairs, ported from pyCapCut's metadata --
+// see src/metadata/README.md). Effects/filters/transitions/masks are NOT freely inventable:
+// CapCut resolves them by a matched (resource_id, effect_id) pair, so only names in these
+// catalogs can be added -- anything else must be harvested from a draft the user already has.
+const loadCatalog = name => JSON.parse(fs.readFileSync(path.join(__dirname, 'metadata', name), 'utf8'));
+export const FILTERS = loadCatalog('filters.json');
+export const TRANSITIONS = loadCatalog('transitions.json');
+export const MASKS = loadCatalog('masks.json');
+const normName = s => String(s).toLowerCase().replace(/[\s_-]/g, '');
+export function findInCatalog(catalog, name) {
+  const target = normName(name);
+  return catalog.find(e => normName(e.name) === target) || null;
+}
+export function searchCatalog(catalog, query, limit = 40) {
+  const list = query ? catalog.filter(e => normName(e.name).includes(normName(query))) : catalog;
+  return list.slice(0, limit).map(e => e.name);
+}
+// material kinds safe to silently carry over from a harvested template segment onto a brand
+// new, unrelated segment (every segment needs its own speed material). Filters/transitions/
+// effects/masks/fades must be added explicitly via their own tools -- not cloned blindly.
+const SAFE_TEMPLATE_REF_KINDS = new Set(['speeds']);
 
 // ---- where the drafts live (override with CAPCUT_DRAFTS_DIR) ----
 const STD_WIN = path.join(os.homedir(), 'AppData/Local/CapCut/User Data/Projects/com.lveditor.draft');
@@ -134,9 +158,10 @@ export class CapCutDraft {
 
   // ---------- tracks ----------
   addTrack(type = 'video', name) {
+    this._pushUndo();
     const tpl = this.templates().tracks[type] || this.templates().tracks.video;
     if (!tpl) throw new Error(`no track template for type ${type}`);
-    const tk = clone(tpl); tk.id = uid(); tk.segments = []; tk.name = name || `${type} track`; tk.is_default_name = false;
+    const tk = clone(tpl); tk.id = uid(); tk.type = type; tk.segments = []; tk.name = name || `${type} track`; tk.is_default_name = false;
     this.content.tracks.push(tk);
     return this.content.tracks.length - 1;
   }
@@ -149,6 +174,7 @@ export class CapCutDraft {
 
   // ---------- add media (video/image/audio) ----------
   _addMedia(kind, file, opts) {
+    this._pushUndo();
     if (!fs.existsSync(file)) throw new Error(`file not found: ${file}`);
     const type = kind === 'audio' ? 'audio' : (kind === 'image' ? 'photo' : 'video');
     const tplType = kind === 'image' ? (this.templates().image ? 'image' : 'video') : kind;
@@ -161,7 +187,7 @@ export class CapCutDraft {
     ['local_material_id', 'origin_material_id', 'local_id', 'request_id', 'aigc_history_id', 'aigc_item_id'].forEach(k => { if (k in mat) mat[k] = ''; });
     const matKey = kind === 'audio' ? 'audios' : (kind === 'image' ? 'videos' : 'videos'); // CapCut stores images in videos[]
     this._mats(matKey).push(mat);
-    const refs = tpl.refs.map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
+    const refs = tpl.refs.filter(({ k }) => SAFE_TEMPLATE_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
     const seg = clone(tpl.seg); seg.id = uid(); seg.material_id = mat.id; seg.extra_material_refs = refs;
     const at = opts.atUs || 0;
     seg.target_timerange = { start: at, duration: dur };
@@ -180,6 +206,7 @@ export class CapCutDraft {
 
   // ---------- text ----------
   addText(text, opts = {}) {
+    this._pushUndo();
     const tpl = this.templates().text;
     if (!tpl) throw new Error('no text template found. Set CAPCUT_TEMPLATE_DRAFT to a draft that contains a text layer.');
     const mat = clone(tpl.mat); mat.id = uid();
@@ -194,7 +221,7 @@ export class CapCutDraft {
       mat.content = JSON.stringify(content);
     } catch { mat.content = JSON.stringify({ text, styles: [{ range: [0, text.length], size: opts.fontSize || 15, fill: { content: { solid: { color: hexToRgb(opts.color || '#ffffff') } } } }] }); }
     this._mats('texts').push(mat);
-    const refs = tpl.refs.map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
+    const refs = tpl.refs.filter(({ k }) => SAFE_TEMPLATE_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
     const seg = clone(tpl.seg); seg.id = uid(); seg.material_id = mat.id; seg.extra_material_refs = refs;
     const at = opts.atUs || 0, dur = opts.durUs || 3 * US;
     seg.target_timerange = { start: at, duration: dur };
@@ -211,12 +238,14 @@ export class CapCutDraft {
   // ---------- edit existing segments ----------
   _find(segId) { for (const tr of this.content.tracks) { const s = (tr.segments || []).find(x => x.id === segId); if (s) return { tr, s }; } throw new Error(`segment not found: ${segId}`); }
   moveSegment(segId, atUs, newTrackIndex) {
+    this._pushUndo();
     const { tr, s } = this._find(segId); const dur = s.target_timerange.duration;
     s.target_timerange.start = atUs;
     if (newTrackIndex != null && this.content.tracks[newTrackIndex]) { tr.segments = tr.segments.filter(x => x.id !== segId); this.content.tracks[newTrackIndex].segments.push(s); }
     this._recalcDuration(); return { segmentId: segId, atSec: atUs / US, durSec: dur / US };
   }
   trimSegment(segId, { atUs, durUs, srcStartUs } = {}) {
+    this._pushUndo();
     const { s } = this._find(segId);
     if (atUs != null) s.target_timerange.start = atUs;
     if (durUs != null) { s.target_timerange.duration = durUs; s.source_timerange.duration = durUs; }
@@ -224,6 +253,7 @@ export class CapCutDraft {
     this._recalcDuration(); return { segmentId: segId };
   }
   splitSegment(segId, atUs) {
+    this._pushUndo();
     const { tr, s } = this._find(segId);
     const t0 = s.target_timerange.start, d = s.target_timerange.duration;
     if (atUs <= t0 || atUs >= t0 + d) throw new Error('split point must be inside the segment');
@@ -238,8 +268,8 @@ export class CapCutDraft {
     tr.segments.push(right);
     return { left: segId, right: right.id };
   }
-  deleteSegment(segId) { const { tr } = this._find(segId); tr.segments = tr.segments.filter(x => x.id !== segId); this._recalcDuration(); return { deleted: segId }; }
-  setProps(segId, props = {}) { const { s } = this._find(segId); this._applyProps(s, props); return { segmentId: segId, applied: Object.keys(props) }; }
+  deleteSegment(segId) { this._pushUndo(); const { tr } = this._find(segId); tr.segments = tr.segments.filter(x => x.id !== segId); this._recalcDuration(); return { deleted: segId }; }
+  setProps(segId, props = {}) { this._pushUndo(); const { s } = this._find(segId); this._applyProps(s, props); return { segmentId: segId, applied: Object.keys(props) }; }
   _applyProps(seg, p) {
     seg.clip = seg.clip || { alpha: 1, flip: { horizontal: false, vertical: false }, rotation: 0, scale: { x: 1, y: 1 }, transform: { x: 0, y: 0 } };
     if (p.scale != null) { seg.clip.scale = { x: p.scale, y: p.scale }; }
@@ -256,7 +286,151 @@ export class CapCutDraft {
   _recalcDuration() { let max = 0; for (const tr of this.content.tracks) for (const s of (tr.segments || [])) max = Math.max(max, s.target_timerange.start + s.target_timerange.duration); this.content.duration = max; }
 
   // escape hatch: apply a JSON-merge-style patch to content (advanced/undocumented ops)
-  rawPatch(patch) { deepMerge(this.content, patch); return { ok: true }; }
+  rawPatch(patch) { this._pushUndo(); deepMerge(this.content, patch); return { ok: true }; }
+
+  // ---------- undo (in-memory, per session; not persisted, capped at 20 steps) ----------
+  // guarded so a method that calls another _pushUndo-covered method internally (e.g. _addMedia
+  // auto-creating a track via addTrack) records ONE snapshot per top-level tool call, not two.
+  _pushUndo() {
+    if (this._inUndoScope) return;
+    this._inUndoScope = true;
+    queueMicrotask(() => { this._inUndoScope = false; });
+    this._undoStack = this._undoStack || [];
+    this._undoStack.push(JSON.stringify(this.content));
+    if (this._undoStack.length > 20) this._undoStack.shift();
+  }
+  undo() {
+    if (!this._undoStack || !this._undoStack.length) throw new Error('nothing to undo');
+    this.content = JSON.parse(this._undoStack.pop());
+    return { ok: true, remaining: this._undoStack.length };
+  }
+
+  // ---------- keyframes: real per-property animation over time (common_keyframes) ----------
+  addKeyframe(segId, propertyType, atUs, value) {
+    this._pushUndo();
+    const { s } = this._find(segId);
+    s.common_keyframes = s.common_keyframes || [];
+    let list = s.common_keyframes.find(k => k.property_type === propertyType);
+    if (!list) { list = { id: uid(), material_id: '', property_type: propertyType, keyframe_list: [] }; s.common_keyframes.push(list); }
+    const entry = { id: uid(), time_offset: atUs, values: [value], curveType: 'Line', graphID: '', left_control: { x: 0, y: 0 }, right_control: { x: 0, y: 0 } };
+    const idx = list.keyframe_list.findIndex(k => k.time_offset === atUs);
+    if (idx >= 0) list.keyframe_list[idx] = entry; else list.keyframe_list.push(entry);
+    list.keyframe_list.sort((a, b) => a.time_offset - b.time_offset);
+    // scale_x/scale_y and uniform scale are mutually exclusive in CapCut's model
+    s.uniform_scale = s.uniform_scale || { on: true, value: 1 };
+    if (propertyType === 'UNIFORM_SCALE') s.uniform_scale.on = true;
+    else if (propertyType === 'KFTypeScaleX' || propertyType === 'KFTypeScaleY') s.uniform_scale.on = false;
+    return { segmentId: segId, propertyType, keyframeCount: list.keyframe_list.length };
+  }
+  removeKeyframes(segId, propertyType) {
+    this._pushUndo();
+    const { s } = this._find(segId);
+    const before = (s.common_keyframes || []).length;
+    s.common_keyframes = (s.common_keyframes || []).filter(k => k.property_type !== propertyType);
+    return { segmentId: segId, removed: before - s.common_keyframes.length };
+  }
+
+  // ---------- audio fade (distinct material, not a volume keyframe) ----------
+  addAudioFade(segId, { fadeInUs, fadeOutUs } = {}) {
+    this._pushUndo();
+    const { s } = this._find(segId);
+    let fadeId = (s.extra_material_refs || []).find(id => findMat(this.content, id)[0] === 'audio_fades');
+    let mat;
+    if (fadeId) { [, mat] = findMat(this.content, fadeId); }
+    else {
+      mat = { id: uid(), type: 'audio_fade', fade_in_duration: 0, fade_out_duration: 0, fade_type: 0 };
+      this._mats('audio_fades').push(mat);
+      s.extra_material_refs = [...(s.extra_material_refs || []), mat.id];
+    }
+    if (fadeInUs != null) mat.fade_in_duration = fadeInUs;
+    if (fadeOutUs != null) mat.fade_out_duration = fadeOutUs;
+    return { segmentId: segId, fadeInSec: mat.fade_in_duration / US, fadeOutSec: mat.fade_out_duration / US };
+  }
+
+  // ---------- filters / transitions / masks: real catalog entries only (see FILTERS/TRANSITIONS/MASKS) ----------
+  addFilter(segId, name, intensity) {
+    this._pushUndo();
+    const f = findInCatalog(FILTERS, name);
+    if (!f) throw new Error(`unknown filter: "${name}" (use capcut_list_filters to search the bundled catalog)`);
+    const { s } = this._find(segId);
+    const params = f.params.map((p, i) => ({
+      name: p.name, default_value: p.default, min_value: p.min, max_value: p.max,
+      value: intensity != null ? p.min + (p.max - p.min) * intensity : p.default,
+      parameterIndex: i, portIndex: 0,
+    }));
+    const mat = {
+      id: uid(), type: 'filter', name: f.name, effect_id: f.effectId, resource_id: f.resourceId,
+      apply_target_type: 0, value: 1.0, adjust_params: params,
+      category_id: '', category_name: '', sub_type: 'none', source_platform: 1, time_range: null,
+      algorithm_artifact_path: '', bloom_params: null,
+      color_match_info: { source_feature_path: '', target_feature_path: '', target_image_path: '' },
+      enable_skin_tone_correction: false, exclusion_group: [], face_adjust_params: [],
+      formula_id: '', intensity_key: '', multi_language_current: '', panel_id: '', platform: 'all', version: '',
+    };
+    this._mats('effects').push(mat);
+    // a segment realistically carries one filter at a time -- drop any prior one before attaching the new one
+    s.extra_material_refs = (s.extra_material_refs || []).filter(id => { const [k, x] = findMat(this.content, id); return !(k === 'effects' && x && x.type === 'filter'); });
+    s.extra_material_refs.push(mat.id);
+    return { segmentId: segId, filter: f.name };
+  }
+  addTransition(segId, name, durationUs) {
+    this._pushUndo();
+    const t = findInCatalog(TRANSITIONS, name);
+    if (!t) throw new Error(`unknown transition: "${name}" (use capcut_list_transitions to search the bundled catalog)`);
+    const { s } = this._find(segId);
+    const mat = {
+      id: uid(), name: t.name, type: 'transition', effect_id: t.effectId, resource_id: t.resourceId,
+      duration: durationUs != null ? durationUs : t.defaultDurationUs, is_overlap: t.isOverlap,
+      category_id: '', category_name: '', platform: 'all',
+    };
+    this._mats('transitions').push(mat);
+    s.extra_material_refs = (s.extra_material_refs || []).filter(id => findMat(this.content, id)[0] !== 'transitions');
+    s.extra_material_refs.push(mat.id);
+    return { segmentId: segId, transition: t.name, durationSec: mat.duration / US, note: 'applies between this segment and whatever segment follows it immediately on the same track' };
+  }
+  addMask(segId, name, opts = {}) {
+    this._pushUndo();
+    const m = findInCatalog(MASKS, name);
+    if (!m) throw new Error(`unknown mask: "${name}" (use capcut_list_masks to see the available shapes)`);
+    const { s } = this._find(segId);
+    const mat = {
+      id: uid(), type: 'mask', name: m.name, resource_type: m.resourceType, resource_id: m.resourceId,
+      platform: 'all', position_info: '',
+      config: {
+        centerX: opts.centerX ?? 0, centerY: opts.centerY ?? 0,
+        width: opts.width ?? 0.5, height: opts.height ?? (0.5 * m.defaultAspectRatio),
+        aspectRatio: m.defaultAspectRatio, rotation: opts.rotation ?? 0,
+        feather: opts.feather ?? 0, invert: !!opts.invert, roundCorner: opts.roundCorner ?? 0,
+      },
+    };
+    this._mats('masks').push(mat);
+    s.extra_material_refs = (s.extra_material_refs || []).filter(id => findMat(this.content, id)[0] !== 'masks');
+    s.extra_material_refs.push(mat.id);
+    return { segmentId: segId, mask: m.name };
+  }
+
+  // ---------- stickers: caller-supplied resource_id -- CapCut resolves geometry from its own catalog ----------
+  addSticker(resourceId, opts = {}) {
+    this._pushUndo();
+    const mat = { id: uid(), type: 'sticker', resource_id: resourceId, sticker_id: resourceId, source_platform: 1 };
+    this._mats('stickers').push(mat);
+    const at = opts.atUs || 0, dur = opts.durUs || 3 * US;
+    const seg = {
+      id: uid(), material_id: mat.id,
+      target_timerange: { start: at, duration: dur }, source_timerange: null,
+      speed: 1, volume: 1, extra_material_refs: [],
+      clip: { alpha: 1, flip: { horizontal: false, vertical: false }, rotation: 0, scale: { x: 1, y: 1 }, transform: { x: 0, y: 0 } },
+      uniform_scale: { on: true, value: 1 }, common_keyframes: [], keyframe_refs: [],
+      visible: true,
+    };
+    this._applyProps(seg, opts);
+    seg.render_index = this._nextRender();
+    const track = this._resolveTrack(opts, 'sticker');
+    seg.track_render_index = opts.trackRenderIndex != null ? opts.trackRenderIndex : this.content.tracks.indexOf(track);
+    track.segments.push(seg);
+    this.content.duration = Math.max(this.content.duration || 0, at + dur);
+    return { segmentId: seg.id, endUs: at + dur };
+  }
 
   // ---------- validate ----------
   validate() {
