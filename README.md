@@ -90,7 +90,7 @@ Filters, transitions, and masks in real CapCut are **not freely inventable** —
 
 **Stickers are different**: CapCut's sticker library is too large and changes too often to bundle, so `capcut_add_sticker` takes a raw `resource_id` you obtain by inspecting a draft where that sticker was placed once (by you or the user, in the real app).
 
-**One open question**: research disagreed on whether masks live under `materials.masks` or `materials.common_mask` depending on CapCut version/build — this fork uses `masks` (the current pyJianYingDraft/CapCut-dedicated source). If `capcut_add_mask` doesn't show up correctly in your CapCut, add a mask by hand once and check which key `capcut_read_timeline`/your draft's JSON actually uses, then say so in an issue.
+**Masks key confirmed against a real draft**: research disagreed on whether masks live under `materials.masks` or `materials.common_mask` — inspecting an actual CapCut 9.4.0 draft settled it: it's `common_mask` (`masks` doesn't exist in a real draft's `materials` at all). `addMask` uses `common_mask`.
 
 ## Guardrails
 - Won't save while CapCut is open (autosave clobber protection), or if the draft changed on disk since this session loaded it.

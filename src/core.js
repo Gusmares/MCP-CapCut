@@ -25,10 +25,15 @@ export function searchCatalog(catalog, query, limit = 40) {
   const list = query ? catalog.filter(e => normName(e.name).includes(normName(query))) : catalog;
   return list.slice(0, limit).map(e => e.name);
 }
-// material kinds safe to silently carry over from a harvested template segment onto a brand
-// new, unrelated segment (every segment needs its own speed material). Filters/transitions/
-// effects/masks/fades must be added explicitly via their own tools -- not cloned blindly.
-const SAFE_TEMPLATE_REF_KINDS = new Set(['speeds']);
+// material kinds that represent a creative choice made on ONE specific harvested segment
+// (a transition, filter, effect, mask, fade, or canned animation) and must NOT be silently
+// cloned onto a brand new, unrelated segment -- these are added explicitly via their own
+// tools instead. Verified against a real, unedited CapCut draft: every segment also carries
+// ~6 boilerplate default refs (speed, canvas, placeholder info, sound-channel mapping, material
+// color, vocal separation, etc.) that a new segment needs too -- those are NOT in this list and
+// get cloned as before. An earlier version of this used an allowlist of just 'speeds', which
+// silently dropped those boilerplate refs from every new segment; this blocklist fixes that.
+const CONTAMINATING_REF_KINDS = new Set(['transitions', 'effects', 'video_effects', 'masks', 'common_mask', 'audio_fades', 'material_animations', 'stickers']);
 
 // ---- where the drafts live (override with CAPCUT_DRAFTS_DIR) ----
 const STD_WIN = path.join(os.homedir(), 'AppData/Local/CapCut/User Data/Projects/com.lveditor.draft');
@@ -189,7 +194,7 @@ export class CapCutDraft {
     ['local_material_id', 'origin_material_id', 'local_id', 'request_id', 'aigc_history_id', 'aigc_item_id'].forEach(k => { if (k in mat) mat[k] = ''; });
     const matKey = kind === 'audio' ? 'audios' : (kind === 'image' ? 'videos' : 'videos'); // CapCut stores images in videos[]
     this._mats(matKey).push(mat);
-    const refs = tpl.refs.filter(({ k }) => SAFE_TEMPLATE_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
+    const refs = tpl.refs.filter(({ k }) => !CONTAMINATING_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
     const seg = clone(tpl.seg); seg.id = uid(); seg.material_id = mat.id; seg.extra_material_refs = refs;
     const track = this._resolveTrack(opts, kind === 'audio' ? 'audio' : 'video');
     const at = opts.atUs != null ? opts.atUs : this._trackEnd(track); // omit atSec to append right after the last clip on this track
@@ -223,7 +228,7 @@ export class CapCutDraft {
       mat.content = JSON.stringify(content);
     } catch { mat.content = JSON.stringify({ text, styles: [{ range: [0, text.length], size: opts.fontSize || 15, fill: { content: { solid: { color: hexToRgb(opts.color || '#ffffff') } } } }] }); }
     this._mats('texts').push(mat);
-    const refs = tpl.refs.filter(({ k }) => SAFE_TEMPLATE_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
+    const refs = tpl.refs.filter(({ k }) => !CONTAMINATING_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
     const seg = clone(tpl.seg); seg.id = uid(); seg.material_id = mat.id; seg.extra_material_refs = refs;
     const dur = opts.durUs || 3 * US;
     const track = this._resolveTrack(opts, 'text');
@@ -425,8 +430,8 @@ export class CapCutDraft {
         feather: opts.feather ?? 0, invert: !!opts.invert, roundCorner: opts.roundCorner ?? 0,
       },
     };
-    this._mats('masks').push(mat);
-    s.extra_material_refs = (s.extra_material_refs || []).filter(id => findMat(this.content, id)[0] !== 'masks');
+    this._mats('common_mask').push(mat);
+    s.extra_material_refs = (s.extra_material_refs || []).filter(id => findMat(this.content, id)[0] !== 'common_mask');
     s.extra_material_refs.push(mat.id);
     return { segmentId: segId, mask: m.name };
   }
