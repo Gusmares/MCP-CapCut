@@ -47,12 +47,22 @@ edits. `capcut_save` refuses when CapCut is running or the draft's `.locked` fil
    - `capcut_add_text` — captions/titles (needs a text-template draft; see `CAPCUT_TEMPLATE_DRAFT`).
    - `capcut_add_track` — separate layers for b-roll, captions, music.
    - `capcut_move_segment` / `_trim_segment` / `_split_segment` / `_delete_segment` — re-cut and retime.
-   - `capcut_set_props` — scale, position, rotation, opacity, volume, speed, visibility.
-   - `capcut_raw_patch` — escape hatch for effects/transitions/rich text (inspect a template first;
-     these are best-effort and version-sensitive).
+   - `capcut_set_props` — scale, position, rotation, opacity, volume, speed, visibility (static value).
+   - `capcut_add_keyframe` / `_remove_keyframes` — real per-property animation (Ken Burns zooms, fades,
+     eased moves) instead of a static value; call it twice with different `atSec`/`value` on the same
+     `property` to animate between them.
+   - `capcut_list_filters` / `_transitions` / `_masks` to search the bundled real-CapCut catalog by
+     name, then `capcut_add_filter` / `_transition` / `_mask` to attach one. Only names in that
+     catalog work — CapCut resolves effects by a matched resource/effect id, not free text.
+   - `capcut_add_audio_fade` — fade-in/out duration on an audio segment.
+   - `capcut_add_sticker` — needs a real `resource_id` (harvest one from a draft where it was placed
+     once; there's no bundled sticker catalog).
+   - `capcut_raw_patch` — escape hatch for anything not covered above (rich text styling, video/
+     character scene effects, canned intro/outro animations — not yet ported to the bundled catalog).
 5. **Validate, then save.** `capcut_validate` (overlaps, duplicate ids, missing media) → fix anything
-   flagged → **close CapCut** → `capcut_save` (writes a `.mcpbak` backup, atomic write, re-validates).
-   Use `capcut_discard` to drop an unsaved session.
+   flagged → **close CapCut** → `capcut_save` (now refuses to write if validate() still has issues, or
+   if the draft changed on disk since this session loaded it — pass `force:true` only if you mean it).
+   Use `capcut_undo` to step back one edit, or `capcut_discard` to drop the whole unsaved session.
 6. **Reopen in CapCut** to review, then export from the app (or encode the assembled pieces with ffmpeg).
 
 ## Tips & gotchas
