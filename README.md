@@ -1,8 +1,8 @@
-# capcut-mcp
+# capcut-mcp (fork)
 
 An MCP server that lets Claude **read and edit CapCut desktop draft projects** — add/move/trim/split clips, text, audio, images; set transforms; validate; save. It works by cloning real segment/material templates out of an existing draft (the only reliable way to produce valid CapCut JSON), and it saves atomically with a backup and a validation pass.
 
-> **Free & open source (MIT).** Built by [James Aldrin Boncales](https://jmsldrn.com) for editors who want Claude to drive CapCut for them.
+> This is a fork of [JmsLdrn/capcut-mcp](https://github.com/JmsLdrn/capcut-mcp) by [James Aldrin Boncales](https://jmsldrn.com), maintained here with security fixes and capability additions (see commit history). Still **free & open source (MIT)** — original copyright retained in [LICENSE](LICENSE).
 >
 > **Not affiliated with CapCut or ByteDance.** CapCut's draft format is proprietary and undocumented; this tool reads/writes it defensively (clone-from-template, backups, validation), but a CapCut update can shift the schema. **Keep the backups it makes.**
 
