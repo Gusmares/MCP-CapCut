@@ -16,10 +16,14 @@ const loadCatalog = name => JSON.parse(fs.readFileSync(path.join(__dirname, 'met
 export const FILTERS = loadCatalog('filters.json');
 export const TRANSITIONS = loadCatalog('transitions.json');
 export const MASKS = loadCatalog('masks.json');
-const normName = s => String(s).toLowerCase().replace(/[\s_-]/g, '');
+export const CAPTION_STYLES = loadCatalog('caption_styles.json');
+// strips accents too (normalize+strip combining marks) -- several catalogs (caption styles) have
+// Portuguese names like "Imobiliária", and a caller typing "imobiliaria" without the accent, or the
+// ASCII-safe `key` field some catalogs carry, should still resolve.
+const normName = s => String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[\s_-]/g, '');
 export function findInCatalog(catalog, name) {
   const target = normName(name);
-  return catalog.find(e => normName(e.name) === target) || null;
+  return catalog.find(e => normName(e.name) === target || (e.key && normName(e.key) === target)) || null;
 }
 export function searchCatalog(catalog, query, limit = 40) {
   const list = query ? catalog.filter(e => normName(e.name).includes(normName(query))) : catalog;
@@ -479,6 +483,92 @@ export class CapCutDraft {
     return { segmentId: seg.id, atSec: at / US, endUs: at + dur };
   }
 
+  // ---------- captions ----------
+  // builds one text segment from a harvested text template, given fully-formed content (text +
+  // styles[]) rather than a single plain string -- shared by addText's simple case and addCaptions'
+  // multi-range (karaoke) case.
+  _buildCaptionSegment(tpl, text, styles, atUs, durUs, track) {
+    const mat = clone(tpl.mat); mat.id = uid();
+    let content; try { content = JSON.parse(mat.content); } catch { content = {}; }
+    content.text = text; content.styles = styles;
+    mat.content = JSON.stringify(content);
+    this._mats('texts').push(mat);
+    const refs = tpl.refs.filter(({ k }) => !CONTAMINATING_REF_KINDS.has(k)).map(({ k, m }) => { const c = clone(m); c.id = uid(); this._mats(k).push(c); return c.id; });
+    const seg = clone(tpl.seg); seg.id = uid(); seg.material_id = mat.id; seg.extra_material_refs = refs;
+    seg.target_timerange = { start: atUs, duration: durUs };
+    seg.source_timerange = { start: 0, duration: durUs };
+    seg.render_index = this._nextRender();
+    seg.track_render_index = this.content.tracks.indexOf(track);
+    track.segments.push(seg);
+    this.content.duration = Math.max(this.content.duration || 0, atUs + durUs);
+    return seg;
+  }
+  // entrance animation for a just-created caption segment, via the real addKeyframe() mechanism --
+  // clamped to the segment's own (possibly very short) duration so it never throws.
+  _animateCaption(seg, style) {
+    const anim = style.animation; if (!anim) return;
+    const atUs = seg.target_timerange.start;
+    const segEndUs = atUs + seg.target_timerange.duration;
+    const endUs = Math.min(atUs + Math.round((anim.durationSec || 0.3) * US), segEndUs);
+    if (endUs - atUs < 10000) return; // too short to animate meaningfully (<10ms) -- leave it static
+    const kf = (prop, from, to) => { this.addKeyframe(seg.id, prop, atUs, from); this.addKeyframe(seg.id, prop, endUs, to); };
+    switch (anim.type) {
+      case 'fade': kf('KFTypeAlpha', 0, 1); break;
+      case 'fade-rise': kf('KFTypeAlpha', 0, 1); kf('KFTypePositionY', -0.03, 0); break;
+      case 'fade-drift': kf('KFTypeAlpha', 0, 1); kf('KFTypePositionX', -0.02, 0); break;
+      case 'fade-slide': kf('KFTypeAlpha', 0, 1); kf('KFTypePositionY', 0.03, 0); break;
+      case 'pop-bounce': case 'lift-bounce': case 'stamp-in': case 'slam-zoom': kf('UNIFORM_SCALE', 0.6, 1.0); break;
+      case 'slam-shake': kf('UNIFORM_SCALE', 0.7, 1.0); break;
+      case 'slide-horizontal': kf('KFTypePositionX', -0.08, 0); break;
+      default: break;
+    }
+  }
+  // words: [{word, startUs, endUs, confidence}] (already in CapCut's microseconds -- see server.js
+  // for the seconds->microseconds conversion at the tool boundary, same convention as everywhere else).
+  // styleNameOrObj: a catalog name (string, resolved via findInCatalog) OR a full style object
+  // (e.g. a caller's copy of a catalog entry with color/highlightColor overridden) -- passing the
+  // object directly lets a client-specific accent color override survive without being silently
+  // discarded by a re-lookup against the unmodified catalog entry.
+  addCaptions(words, styleNameOrObj, opts = {}) {
+    this._pushUndo();
+    if (!words || !words.length) throw new Error('no words to caption (empty transcript)');
+    const style = typeof styleNameOrObj === 'string' ? findInCatalog(CAPTION_STYLES, styleNameOrObj) : styleNameOrObj;
+    if (!style) throw new Error(`unknown caption style: "${styleNameOrObj}" (use capcut_list_caption_styles)`);
+    const tpl = this.templates().text;
+    if (!tpl) throw new Error('no text template found. Set CAPCUT_TEMPLATE_DRAFT to a draft that contains a text layer.');
+    const track = opts.trackIndex != null
+      ? this.content.tracks[opts.trackIndex]
+      : (this.content.tracks[this.addTrack('text', 'Captions')]);
+    if (!track) throw new Error(`no track at index ${opts.trackIndex}`);
+    const cues = capCueOverlaps(chunkWords(words, style));
+    if (opts.previewCues != null) cues.length = Math.min(cues.length, opts.previewCues);
+    const segmentIds = [];
+    for (const cue of cues) {
+      if (shouldKaraoke(cue, style)) {
+        for (let i = 0; i < cue.words.length; i++) {
+          const w = cue.words[i];
+          const styles = buildWordRanges(cue.words, i, style, style.fontSize);
+          const seg = this._buildCaptionSegment(tpl, cue.text, styles, w.startUs, Math.max(w.endUs - w.startUs, 1), track);
+          segmentIds.push(seg.id);
+        }
+      } else {
+        const styles = buildWordRanges(cue.words, -1, style, style.fontSize);
+        const seg = this._buildCaptionSegment(tpl, cue.text, styles, cue.start, Math.max(cue.end - cue.start, 1), track);
+        this._animateCaption(seg, style);
+        segmentIds.push(seg.id);
+      }
+    }
+    return { segmentIds, cueCount: cues.length, wordCount: words.length, style: style.name, trackIndex: this.content.tracks.indexOf(track), dryRun: false };
+  }
+  clearCaptionTrack(trackIndex) {
+    this._pushUndo();
+    const track = this.content.tracks[trackIndex];
+    if (!track) throw new Error(`no track at index ${trackIndex}`);
+    const ids = (track.segments || []).map(s => s.id);
+    for (const id of ids) this.deleteSegment(id);
+    return { trackIndex, removed: ids.length };
+  }
+
   // ---------- validate ----------
   validate() {
     const c = this.content; const issues = [], warnings = [];
@@ -518,6 +608,20 @@ export class CapCutDraft {
     for (const s of (c.materials?.audio_fades || [])) {
       const referenced = c.tracks.some(tr => (tr.segments || []).some(seg => (seg.extra_material_refs || []).includes(s.id)));
       if (!referenced) warnings.push(`audio_fade material ${s.id} exists but is not referenced by any segment (orphaned)`);
+    }
+    // text `content` is a JSON string CapCut never validates for us -- a malformed one, or a
+    // styles[].range outside the text's own bounds, would previously pass validate() clean and only
+    // surface as a broken/missing caption after opening the draft in CapCut. Ranges are checked in
+    // UTF-16 code units (JS string .length), matching how CapCut itself indexes them.
+    for (const m of (c.materials?.texts || [])) {
+      let parsed; try { parsed = JSON.parse(m.content); } catch { issues.push(`text material ${m.id} has malformed content (not valid JSON)`); continue; }
+      if (!parsed.text) { issues.push(`text material ${m.id} has empty text`); continue; }
+      const len = parsed.text.length;
+      const ranges = [...(parsed.styles || [])].map(s => s.range).filter(Array.isArray).sort((a, b) => a[0] - b[0]);
+      for (const [start, end] of ranges) {
+        if (start < 0 || end > len || start >= end) issues.push(`text material ${m.id} has a style range [${start},${end}] outside its text bounds [0,${len}]`);
+      }
+      for (let i = 1; i < ranges.length; i++) if (ranges[i][0] < ranges[i - 1][1]) issues.push(`text material ${m.id} has overlapping style ranges [${ranges[i - 1]}] and [${ranges[i]}]`);
     }
     return { ok: issues.length === 0, issues, warnings };
   }
@@ -563,5 +667,70 @@ export function cloneDraft(base, newName, { empty = false } = {}) {
 
 function hexToRgb(hex) { const h = hex.replace('#', ''); return [parseInt(h.slice(0, 2), 16) / 255, parseInt(h.slice(2, 4), 16) / 255, parseInt(h.slice(4, 6), 16) / 255]; }
 function deepMerge(t, s) { for (const k of Object.keys(s)) { if (s[k] && typeof s[k] === 'object' && !Array.isArray(s[k]) && t[k] && typeof t[k] === 'object') deepMerge(t[k], s[k]); else t[k] = s[k]; } return t; }
+
+// ---- captions: chunk a word-level transcript into readable cues, per a caption style preset ----
+const NUMERIC_TOKEN_RE = /[\d]/; // a word containing any digit -- price, percentage, count, date, etc.
+function isNumericToken(word) { return NUMERIC_TOKEN_RE.test(word); }
+
+// words: [{word, startUs, endUs, confidence}], already sorted by time. Groups into cues honoring
+// chunkMaxWords/chunkMaxChars, a natural-pause break (>300ms gap), and the universal rule that a
+// numeric token (price/%/count) always gets its own cue, never split across two.
+function chunkWords(words, style) {
+  const PAUSE_US = 300000;
+  const cues = [];
+  let cur = [];
+  const curChars = () => cur.reduce((n, w) => n + w.word.length + 1, 0);
+  const flush = () => { if (cur.length) { cues.push(cur); cur = []; } };
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (isNumericToken(w.word)) { flush(); cues.push([w]); continue; }
+    if (cur.length) {
+      const gap = w.startUs - cur[cur.length - 1].endUs;
+      const wouldExceedWords = cur.length + 1 > (style.chunkMaxWords || 6);
+      const wouldExceedChars = curChars() + w.word.length + 1 > (style.chunkMaxChars || 30);
+      if (gap > PAUSE_US || wouldExceedWords || wouldExceedChars) flush();
+    }
+    cur.push(w);
+  }
+  flush();
+  return cues.map(cueWords => {
+    const text = cueWords.map(w => w.word).join(' ');
+    const cps = style.cps || 15;
+    const minDurUs = Math.round((text.length / cps) * US);
+    const spokenStart = cueWords[0].startUs, spokenEnd = cueWords[cueWords.length - 1].endUs;
+    const end = Math.max(spokenEnd, spokenStart + minDurUs);
+    return { words: cueWords, text, start: spokenStart, end };
+  });
+}
+// cap each cue's displayed end at (nextCue.start - a small gap), so extending short cues for
+// readability (CPS floor) never overlaps the next one
+function capCueOverlaps(cues) {
+  const GAP_US = 20000;
+  for (let i = 0; i < cues.length - 1; i++) {
+    const nextStart = cues[i + 1].start;
+    if (cues[i].end > nextStart - GAP_US) cues[i].end = Math.max(cues[i].start + 1, nextStart - GAP_US);
+  }
+  return cues;
+}
+function shouldKaraoke(cue, style) {
+  if (!style.karaoke) return false;
+  if (!style.karaokeOnly) return true;
+  // "benefit" (semantic) detection isn't implemented -- documented simplification, same heuristic as "number"
+  return cue.words.length === 1 && isNumericToken(cue.words[0].word);
+}
+// builds a styles[] array covering the WHOLE cue text with one range per word (UTF-16 code units,
+// via JS string .length -- matches how CapCut itself indexes ranges, and survives accents/emoji).
+// activeIndex >= 0 highlights that one word (karaoke); -1 means every word shares the plain color.
+function buildWordRanges(cueWords, activeIndex, style, fontSize) {
+  const ranges = []; let cursor = 0;
+  cueWords.forEach((w, i) => {
+    const start = cursor, end = cursor + w.word.length;
+    const active = activeIndex === i;
+    const color = (active && style.highlightColor) ? style.highlightColor : style.color;
+    ranges.push({ range: [start, end], size: fontSize, fill: { content: { solid: { color: hexToRgb(color) } } } });
+    cursor = end + 1; // +1 for the joining space
+  });
+  return ranges;
+}
 
 export const _us = US;

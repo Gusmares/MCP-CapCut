@@ -39,8 +39,11 @@ edits. `capcut_save` refuses when CapCut is running or the draft's `.locked` fil
    structure. To edit in place, just operate on the existing draft.
 3. **Prepare media (companion tools, outside CapCut):**
    - Motion graphics / animated scenes → **HyperFrames**, rendered to `.mp4` (or alpha `.mov`).
-   - Captions → **WhisperFlow** transcript; convert cue timings to seconds for `capcut_add_text`,
-     or burn them in HyperFrames if you want styled/animated captions.
+   - Captions → real pipeline now: `capcut_transcribe` (Deepgram by default, or `provider:"local"`
+     for no-cost/no-account) → `capcut_review_transcript` for a quick confidence check →
+     `capcut_add_captions` with a style from `capcut_list_caption_styles` (or `cliente:"name"` to
+     pull that client's accent color from `perfis-criativo/`). See the repo README's "Auto-captions"
+     section for setup. Only reach for HyperFrames if you need something a caption preset can't do.
    - Use **ffprobe** to confirm each asset's duration before placing it so timings line up.
 4. **Assemble in the draft (session edits accumulate in memory):**
    - `capcut_add_video` / `_image` / `_audio` — place media on a track. **Omit `atSec`** when clips

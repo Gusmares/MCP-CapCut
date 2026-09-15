@@ -3,6 +3,14 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# local ASR fallback venv (huge, machine-specific -- see vendor/requirements-whisper.txt to rebuild)
+vendor/whisper-env/
+vendor/*.wav
+vendor/*.mp3
+
+# cached transcripts (may contain client audio content, and are throwaway)
+.transcript-cache/
+
 # CapCut working artifacts (never commit real drafts or backups)
 *.mcpbak
 *.tmp

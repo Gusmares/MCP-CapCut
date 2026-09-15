@@ -13,7 +13,10 @@ An MCP server that lets Claude **read and edit CapCut desktop draft projects** �
 
 ## Configure (env, optional)
 - `CAPCUT_DRAFTS_DIR` — your CapCut Drafts folder. Auto-detects the standard `%LOCALAPPDATA%\CapCut\...` (Windows) / `~/Movies/CapCut/...` (macOS) locations; **set this if your drafts live elsewhere** (e.g. a different drive).
-- `CAPCUT_TEMPLATE_DRAFT` — name of a draft that contains video **and text** layers, used to harvest templates when the draft you're editing lacks one. **Default `0723` is the author's own draft and won't exist on your machine** — set this to one of *your* drafts that has a text layer, or the `capcut_add_text` tool won't work. (Everything else works without it.)
+- `CAPCUT_TEMPLATE_DRAFT` — name of a draft that contains video **and text** layers, used to harvest templates when the draft you're editing lacks one. **Default `0723` is the author's own draft and won't exist on your machine** — set this to one of *your* drafts that has a text layer, or `capcut_add_text`/`capcut_add_captions` won't work. (Everything else works without it.)
+- `DEEPGRAM_API_KEY` — needed for `capcut_transcribe`'s default provider. See [Auto-captions](#auto-captions).
+- `CAPCUT_WHISPER_PYTHON` — path to the local ASR venv's `python.exe`, if you moved it from the default `vendor/whisper-env/`.
+- `CAPCUT_PROFILES_DIR` — where `capcut_add_captions`' `cliente:"name"` looks for `{name}.md` client profiles. Defaults to `../perfis-criativo` relative to this repo.
 
 ## Install
 ```bash
@@ -70,6 +73,11 @@ All times at the tool boundary are in **seconds** (converted to CapCut's microse
 | `capcut_add_audio_fade` | fade-in/fade-out duration on an audio segment |
 | `capcut_add_sticker` | place a sticker by CapCut `resource_id` (no bundled sticker catalog — see Limitations) |
 | `capcut_undo` | step back up to 20 in-session edits (does not touch anything already saved) |
+| `capcut_transcribe` | extract audio + transcribe with word-level timestamps (Deepgram, default; or `provider:"local"` for faster-whisper+WhisperX, no cost/account) |
+| `capcut_review_transcript` | list transcript words below a confidence threshold, for a quick human check |
+| `capcut_add_captions` | generate real auto-captions from a transcript, applying a style preset from `capcut_list_caption_styles` (chunking, entrance animation, optional word-by-word karaoke highlight) |
+| `capcut_clear_captions` | remove all segments from a caption track, to switch styles or start over |
+| `capcut_list_caption_styles` | search the 10 bundled business-niche caption presets |
 | `capcut_raw_patch` | advanced deep-merge escape hatch for anything not covered above |
 | `capcut_validate` | overlaps, duplicate ids, missing media — **now enforced by `capcut_save`**, not just informational |
 | `capcut_save` / `capcut_discard` | persist / drop the session |
@@ -92,6 +100,23 @@ Filters, transitions, and masks in real CapCut are **not freely inventable** —
 **Stickers are different**: CapCut's sticker library is too large and changes too often to bundle, so `capcut_add_sticker` takes a raw `resource_id` you obtain by inspecting a draft where that sticker was placed once (by you or the user, in the real app).
 
 **Masks key confirmed against a real draft**: research disagreed on whether masks live under `materials.masks` or `materials.common_mask` — inspecting an actual CapCut 9.4.0 draft settled it: it's `common_mask` (`masks` doesn't exist in a real draft's `materials` at all). `addMask` uses `common_mask`.
+
+## Auto-captions
+
+`capcut_transcribe` → (optional) `capcut_review_transcript` → `capcut_add_captions` → `capcut_validate` → `capcut_save`. Needs a text template draft, same requirement as `capcut_add_text` (see **Configure** above).
+
+**Transcription provider:**
+- **`deepgram` (default)** — needs a [Deepgram](https://console.deepgram.com) account and `DEEPGRAM_API_KEY` set as an environment variable. ~US$0.004-0.005/min, pt-BR by default (pass `language:"multi"` for heavy pt/en code-switching).
+- **`local`** — no account, no cost, nothing leaves your machine. Needs a one-time setup:
+  ```bash
+  python -m venv vendor/whisper-env
+  vendor/whisper-env/Scripts/python -m pip install -r vendor/requirements-whisper.txt --extra-index-url https://download.pytorch.org/whl/cu126
+  ```
+  See the header of `vendor/requirements-whisper.txt` for why the `--extra-index-url` matters (installing `faster-whisper`/`whisperx` any other way can silently downgrade a working CUDA build of `torch` to a CPU-only one). No NVIDIA GPU? Drop that flag — it still works, just slower than real-time on a full clip. Override the interpreter path with `CAPCUT_WHISPER_PYTHON` if you move the venv.
+
+**Caption styles**: 10 business-niche presets (`src/metadata/caption_styles.json`) covering color, chunking (max words/chars, target reading speed), entrance animation (via the real `addKeyframe()`, not a static value), and word-by-word "karaoke" highlighting for the niches that call for it. A numeric token (price, %, count) always gets isolated into its own cue and — for karaoke styles — its own highlighted moment. `cliente:"name"` (matching a file in `perfis-criativo/`) auto-resolves an accent-color override from that client's real palette; `accentColorOverride` sets one explicitly.
+
+**Known limitation**: font family/weight and pill/outline backgrounds aren't in the confirmed-safe schema yet (see [Bundled effect catalog](#bundled-effect-catalog) reasoning) — presets differentiate today via color, size, chunking, and animation. `capcut_add_captions` on a style whose `localOnly` flag is set (jurídico/financeiro, saúde) is a hint to route through `provider:"local"` in `capcut_transcribe` for that content, not an enforced rule.
 
 ## Guardrails
 - Won't save while CapCut is open (autosave clobber protection), or if the draft changed on disk since this session loaded it.

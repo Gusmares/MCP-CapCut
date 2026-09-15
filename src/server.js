@@ -5,9 +5,70 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { CapCutDraft, cloneDraft, listDrafts, DRAFTS_DIR, FILTERS, TRANSITIONS, MASKS, searchCatalog } from './core.js';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { execFileSync } from 'child_process';
+import { fileURLToPath } from 'url';
+import { CapCutDraft, cloneDraft, listDrafts, DRAFTS_DIR, FILTERS, TRANSITIONS, MASKS, CAPTION_STYLES, searchCatalog, findInCatalog } from './core.js';
 
 const KEYFRAME_PROPERTIES = ['KFTypePositionX', 'KFTypePositionY', 'KFTypeRotation', 'KFTypeScaleX', 'KFTypeScaleY', 'UNIFORM_SCALE', 'KFTypeAlpha', 'KFTypeSaturation', 'KFTypeContrast', 'KFTypeBrightness', 'KFTypeVolume'];
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PKG_ROOT = path.join(__dirname, '..');
+const CACHE_DIR = path.join(PKG_ROOT, '.transcript-cache');
+const WHISPER_PYTHON = process.env.CAPCUT_WHISPER_PYTHON || path.join(PKG_ROOT, 'vendor', 'whisper-env', 'Scripts', 'python.exe');
+const WHISPER_SCRIPT = path.join(PKG_ROOT, 'vendor', 'transcribe_local.py');
+const PROFILES_DIR = process.env.CAPCUT_PROFILES_DIR || path.join(PKG_ROOT, '..', 'perfis-criativo');
+
+// ---------- transcription helpers ----------
+function extractAudio(sourceFile, { preprocess = true } = {}) {
+  const out = path.join(CACHE_DIR, `audio-${crypto.randomUUID()}.wav`);
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const filters = preprocess ? 'highpass=f=80,lowpass=f=8000,loudnorm' : null;
+  const args = ['-y', '-i', sourceFile, '-vn', '-ac', '1', '-ar', '16000'];
+  if (filters) args.push('-af', filters);
+  args.push(out);
+  execFileSync('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+  return out;
+}
+
+async function transcribeDeepgram(audioPath, { language = 'pt-BR', vocabularyBoost } = {}) {
+  const key = process.env.DEEPGRAM_API_KEY;
+  if (!key) throw new Error('DEEPGRAM_API_KEY is not set. Create a Deepgram account (https://console.deepgram.com), generate an API key, and set it as the DEEPGRAM_API_KEY environment variable for this MCP server -- or use provider:"local" instead (no account needed).');
+  const params = new URLSearchParams({ model: 'nova-3', language, smart_format: 'true', punctuate: 'true' });
+  if (vocabularyBoost?.length) params.set('keyterm', vocabularyBoost.join(','));
+  const audioBuf = fs.readFileSync(audioPath);
+  const res = await fetch(`https://api.deepgram.com/v1/listen?${params}`, {
+    method: 'POST',
+    headers: { Authorization: `Token ${key}`, 'Content-Type': 'audio/wav' },
+    body: audioBuf,
+  });
+  if (!res.ok) throw new Error(`Deepgram API error ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  const alt = json?.results?.channels?.[0]?.alternatives?.[0];
+  const words = (alt?.words || []).map(w => ({ word: (w.punctuated_word || w.word).trim(), startUs: Math.round(w.start * US), endUs: Math.round(w.end * US), confidence: w.confidence }));
+  return { words, language: json?.results?.channels?.[0]?.detected_language || language, durationSec: json?.metadata?.duration };
+}
+
+function transcribeLocal(audioPath, { language = 'pt' } = {}) {
+  if (!fs.existsSync(WHISPER_PYTHON)) throw new Error(`local transcription venv not found at ${WHISPER_PYTHON}. Run: python -m venv vendor/whisper-env, then pip install -r vendor/requirements-whisper.txt --extra-index-url https://download.pytorch.org/whl/cu126 (see that file's header for details and a CPU-only alternative).`);
+  const langCode = language.split('-')[0]; // whisper wants ISO 639-1 ("pt"), not "pt-BR"
+  const out = execFileSync(WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, '--language', langCode], { maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' });
+  const lastLine = out.trim().split('\n').pop(); // ignore any stderr-ish progress lines that leaked to stdout
+  const parsed = JSON.parse(lastLine);
+  return { words: parsed.words.map(w => ({ word: w.word, startUs: Math.round(w.start * US), endUs: Math.round(w.end * US), confidence: w.confidence })), language: parsed.language, durationSec: parsed.durationSec, aligned: parsed.aligned, device: parsed.device };
+}
+
+function readClientAccentColor(cliente) {
+  const p = path.join(PROFILES_DIR, `${cliente}.md`);
+  if (!fs.existsSync(p)) return null;
+  const text = fs.readFileSync(p, 'utf8');
+  const rows = text.split('\n').filter(l => l.trim().startsWith('|') && /#[0-9a-fA-F]{6}/.test(l));
+  const ctaRow = rows.find(l => /cta|destaque/i.test(l));
+  const hexMatch = (ctaRow || rows[0] || '').match(/#[0-9a-fA-F]{6}/);
+  return hexMatch ? hexMatch[0] : null;
+}
 
 const US = 1e6;
 const open = new Map();                       // name -> live CapCutDraft (unsaved edits)
@@ -42,6 +103,10 @@ s.tool('capcut_list_transitions', `Search the bundled catalog of ${TRANSITIONS.l
   { query: z.string().optional() }, wrap(async ({ query }) => ({ total: TRANSITIONS.length, matches: searchCatalog(TRANSITIONS, query) })));
 
 s.tool('capcut_list_masks', `List the ${MASKS.length} available mask shapes.`, {}, wrap(async () => ({ masks: MASKS.map(m => m.name) })));
+
+s.tool('capcut_list_caption_styles', `List the ${CAPTION_STYLES.length} caption style presets (by business niche): color, chunking, whether it does word-by-word karaoke highlighting, entrance animation.`,
+  { query: z.string().optional() },
+  wrap(async ({ query }) => ({ total: CAPTION_STYLES.length, styles: (query ? CAPTION_STYLES.filter(s => s.name.toLowerCase().includes(query.toLowerCase()) || s.key.includes(query.toLowerCase())) : CAPTION_STYLES).map(s => ({ key: s.key, name: s.name, karaoke: s.karaoke, localOnly: !!s.localOnly, color: s.color, highlightColor: s.highlightColor })) })));
 
 s.tool('capcut_read_timeline', 'Read a draft: canvas, fps, tracks and every segment (id, media, times, layer). Reflects any pending unsaved edits from this session.',
   { draft: z.string() }, wrap(async ({ draft }) => get(draft).timeline()));
@@ -131,6 +196,81 @@ s.tool('capcut_add_sticker', 'Add a sticker by CapCut resource_id (get one by in
 
 s.tool('capcut_undo', 'Undo the last edit in this session (up to 20 steps back). Does not affect anything already saved to disk.',
   { draft: z.string() }, wrap(async ({ draft }) => get(draft).undo()));
+
+s.tool('capcut_transcribe', 'Extract audio (ffmpeg) and transcribe it with word-level timestamps, for building auto-captions. provider "deepgram" (default; needs DEEPGRAM_API_KEY, ~US$0.004-0.005/min, pt-BR) or "local" (faster-whisper+WhisperX via a dedicated venv -- no cost, no internet, no account; required by policy for confidential content). Returns a warning instead of failing if no speech is detected.',
+  {
+    file: z.string().describe('path to the source video/audio file'),
+    provider: z.enum(['deepgram', 'local']).optional().describe('default: deepgram. Use "local" for confidential/client-sensitive material.'),
+    language: z.string().optional().describe('default "pt-BR" (monolingual); pass "multi" (deepgram only) for heavy pt/en code-switching'),
+    vocabularyBoost: z.array(z.string()).optional().describe('brand/product names to bias the ASR toward (deepgram only)'),
+    preprocess: z.boolean().optional().describe('default true: loudness normalization + voice bandpass filter before transcription'),
+    cacheAs: z.string().optional().describe('save the transcript under this name for capcut_review_transcript / capcut_add_captions to reuse'),
+  },
+  wrap(async ({ file, provider, language, vocabularyBoost, preprocess, cacheAs }) => {
+    if (!fs.existsSync(file)) throw new Error(`file not found: ${file}`);
+    const audioPath = extractAudio(file, { preprocess: preprocess !== false });
+    try {
+      const result = provider === 'local'
+        ? transcribeLocal(audioPath, { language: language || 'pt' })
+        : await transcribeDeepgram(audioPath, { language: language || 'pt-BR', vocabularyBoost });
+      const out = { ...result, provider: provider || 'deepgram', wordCount: result.words.length };
+      if (!result.words.length) out.warning = 'no speech detected in this file -- check the source has audible dialogue, or try preprocess:false if the voice filter may be cutting it out';
+      if (cacheAs) { fs.mkdirSync(CACHE_DIR, { recursive: true }); fs.writeFileSync(path.join(CACHE_DIR, `${cacheAs}.json`), JSON.stringify(out)); out.cachedAs = cacheAs; }
+      return out;
+    } finally {
+      try { fs.unlinkSync(audioPath); } catch {}
+    }
+  }));
+
+s.tool('capcut_review_transcript', 'List transcript words below a confidence threshold, for a quick human check before applying a caption style.',
+  { cachedTranscript: z.string(), minConfidence: z.number().optional().describe('default 0.6') },
+  wrap(async ({ cachedTranscript, minConfidence }) => {
+    const p = path.join(CACHE_DIR, `${cachedTranscript}.json`);
+    if (!fs.existsSync(p)) throw new Error(`no cached transcript named "${cachedTranscript}" (run capcut_transcribe with cacheAs:"${cachedTranscript}" first)`);
+    const t = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const threshold = minConfidence ?? 0.6;
+    const flagged = t.words.map((w, i) => ({ ...w, i })).filter(w => (w.confidence ?? 1) < threshold)
+      .map(w => ({ word: w.word, startSec: w.startUs / US, endSec: w.endUs / US, confidence: w.confidence, contextBefore: t.words.slice(Math.max(0, w.i - 3), w.i).map(x => x.word).join(' '), contextAfter: t.words.slice(w.i + 1, w.i + 4).map(x => x.word).join(' ') }));
+    const avgConfidence = t.words.length ? t.words.reduce((n, w) => n + (w.confidence ?? 1), 0) / t.words.length : null;
+    return { wordCount: t.words.length, avgConfidence, flaggedCount: flagged.length, flagged };
+  }));
+
+s.tool('capcut_add_captions', 'Generate caption segments in a draft from a transcript, applying a style preset (from capcut_list_caption_styles). Words must already be in the target language/order -- run capcut_transcribe (and ideally capcut_review_transcript) first.',
+  {
+    draft: z.string(),
+    words: z.array(z.object({ word: z.string(), startSec: z.number(), endSec: z.number(), confidence: z.number().optional() })).optional().describe('inline transcript; omit if using cachedTranscript'),
+    cachedTranscript: z.string().optional().describe('name saved by capcut_transcribe\'s cacheAs'),
+    style: z.string().describe('caption style preset name, from capcut_list_caption_styles'),
+    cliente: z.string().optional().describe('client name in perfis-criativo/{cliente}.md -- auto-resolves an accent color override from that profile\'s palette if accentColorOverride is not also given'),
+    trackIndex: z.number().int().optional().describe('reuse an existing text track; a new "Captions" track is created if omitted'),
+    replace: z.boolean().optional().describe('default false: if true and trackIndex is given, clears that track before regenerating'),
+    previewCues: z.number().int().optional().describe('materialize only the first N cues, to check the style in CapCut before committing the whole video'),
+    accentColorOverride: z.string().optional().describe('hex color overriding the style\'s own accent/highlight color; takes precedence over "cliente"'),
+  },
+  wrap(async ({ draft, words, cachedTranscript, style, cliente, trackIndex, replace, previewCues, accentColorOverride }) => {
+    let wordList = words;
+    if (!wordList) {
+      if (!cachedTranscript) throw new Error('provide either "words" or "cachedTranscript"');
+      const p = path.join(CACHE_DIR, `${cachedTranscript}.json`);
+      if (!fs.existsSync(p)) throw new Error(`no cached transcript named "${cachedTranscript}"`);
+      const t = JSON.parse(fs.readFileSync(p, 'utf8'));
+      wordList = t.words.map(w => ({ word: w.word, startSec: w.startUs / US, endSec: w.endUs / US, confidence: w.confidence }));
+    }
+    if (!wordList.length) throw new Error('the transcript has no words -- nothing to caption');
+    const wordsUs = wordList.map(w => ({ word: w.word, startUs: Math.round(w.startSec * US), endUs: Math.round(w.endSec * US), confidence: w.confidence }));
+    const styleEntry = findInCatalog(CAPTION_STYLES, style);
+    if (!styleEntry) throw new Error(`unknown caption style: "${style}" (use capcut_list_caption_styles)`);
+    let colorOverride = accentColorOverride;
+    if (!colorOverride && cliente) colorOverride = readClientAccentColor(cliente);
+    const effectiveStyle = colorOverride ? { ...styleEntry, highlightColor: colorOverride, color: styleEntry.highlightColor ? styleEntry.color : colorOverride } : styleEntry;
+    const d = get(draft);
+    if (replace && trackIndex != null) d.clearCaptionTrack(trackIndex);
+    return d.addCaptions(wordsUs, effectiveStyle, { trackIndex, previewCues });
+  }));
+
+s.tool('capcut_clear_captions', 'Remove all segments from a caption track (to switch styles or start over).',
+  { draft: z.string(), trackIndex: z.number().int() },
+  wrap(async ({ draft, trackIndex }) => get(draft).clearCaptionTrack(trackIndex)));
 
 s.tool('capcut_raw_patch', 'Advanced escape hatch: deep-merge a JSON patch into draft_content (undocumented ops). Use with care.',
   { draft: z.string(), patch: z.record(z.any()) }, wrap(async ({ draft, patch }) => get(draft).rawPatch(patch)));
