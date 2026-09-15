@@ -72,6 +72,10 @@ s.tool('capcut_add_track', 'Add a new track (video | audio | text | sticker).',
   { draft: z.string(), type: z.enum(['video', 'audio', 'text', 'sticker']).optional(), name: z.string().optional() },
   wrap(async ({ draft, type, name }) => ({ trackIndex: get(draft).addTrack(type || 'video', name) })));
 
+s.tool('capcut_set_track_mute', 'Mute/unmute an entire track. A track cloned from a muted template starts muted with no visible sign of it in capcut_read_timeline other than the "muted" field -- this is the fix for "the video has no sound" when the clips themselves have audio.',
+  { draft: z.string(), trackIndex: z.number().int(), muted: z.boolean() },
+  wrap(async ({ draft, trackIndex, muted }) => get(draft).setTrackMute(trackIndex, muted)));
+
 s.tool('capcut_move_segment', 'Move a segment to a new start time and optionally another track.',
   { draft: z.string(), segmentId: z.string(), atSec: z.number(), trackIndex: z.number().int().optional() },
   wrap(async ({ draft, segmentId, atSec, trackIndex }) => get(draft).moveSegment(segmentId, sec(atSec), trackIndex)));

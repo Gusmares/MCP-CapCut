@@ -146,12 +146,15 @@ export class CapCutDraft {
   // ---------- read ----------
   timeline() {
     const c = this.content;
+    const locked = fs.existsSync(path.join(this.dir, '.locked'));
+    const running = capcutRunning();
     return {
       name: this.name, durationSec: +(c.duration / US).toFixed(3), fps: c.fps,
       canvas: c.canvas_config && { w: c.canvas_config.width, h: c.canvas_config.height, ratio: c.canvas_config.ratio },
-      locked: fs.existsSync(path.join(this.dir, '.locked')), capcutRunning: capcutRunning(),
+      locked, capcutRunning: running,
+      warning: (locked || running) ? '⚠ CapCut is open on this draft -- edits made in the app from now on may conflict with what this session is building. Close it before capcut_save.' : undefined,
       tracks: (c.tracks || []).map((tr, ti) => ({
-        index: ti, type: tr.type, name: tr.name, segments: (tr.segments || []).map(s => {
+        index: ti, type: tr.type, name: tr.name, muted: !!tr.attribute, segments: (tr.segments || []).map(s => {
           const [, m] = findMat(c, s.material_id);
           return {
             id: s.id, material: m ? (m.material_name || (m.path || '').split(/[\\/]/).pop() || m.type) : null,
@@ -161,6 +164,13 @@ export class CapCutDraft {
         }),
       })),
     };
+  }
+  setTrackMute(trackIndexOrId, muted) {
+    this._pushUndo();
+    const track = typeof trackIndexOrId === 'number' ? this.content.tracks[trackIndexOrId] : this.content.tracks.find(t => t.id === trackIndexOrId);
+    if (!track) throw new Error(`no track ${trackIndexOrId}`);
+    track.attribute = muted ? 1 : 0;
+    return { track: track.name, type: track.type, muted: !!muted };
   }
 
   // ---------- tracks ----------
@@ -336,11 +346,20 @@ export class CapCutDraft {
   addKeyframe(segId, propertyType, atUs, value) {
     this._pushUndo();
     const { s } = this._find(segId);
+    // atUs is absolute timeline time, matching every other timing param in this API (moveSegment,
+    // trimSegment, addVideo/text/...) -- but CapCut itself stores time_offset relative to the
+    // segment's OWN start (confirmed against pyJianYingDraft/VectCutAPI's Keyframe class). Convert
+    // here so callers never have to do timeline-minus-segment-start math themselves; a bug that did
+    // exactly that (passed absolute time straight through) shipped a keyframe outside the segment's
+    // range that CapCut silently never reached.
+    const localUs = atUs - s.target_timerange.start;
+    const localDur = s.target_timerange.duration;
+    if (localUs < 0 || localUs > localDur) throw new Error(`keyframe at ${(atUs / US).toFixed(3)}s is outside this segment's span on the timeline [${(s.target_timerange.start / US).toFixed(3)}s, ${((s.target_timerange.start + localDur) / US).toFixed(3)}s] -- pass an absolute timeline time within the segment, not relative to its start`);
     s.common_keyframes = s.common_keyframes || [];
     let list = s.common_keyframes.find(k => k.property_type === propertyType);
     if (!list) { list = { id: uid(), material_id: '', property_type: propertyType, keyframe_list: [] }; s.common_keyframes.push(list); }
-    const entry = { id: uid(), time_offset: atUs, values: [value], curveType: 'Line', graphID: '', left_control: { x: 0, y: 0 }, right_control: { x: 0, y: 0 } };
-    const idx = list.keyframe_list.findIndex(k => k.time_offset === atUs);
+    const entry = { id: uid(), time_offset: localUs, values: [value], curveType: 'Line', graphID: '', left_control: { x: 0, y: 0 }, right_control: { x: 0, y: 0 } };
+    const idx = list.keyframe_list.findIndex(k => k.time_offset === localUs);
     if (idx >= 0) list.keyframe_list[idx] = entry; else list.keyframe_list.push(entry);
     list.keyframe_list.sort((a, b) => a.time_offset - b.time_offset);
     // scale_x/scale_y and uniform scale are mutually exclusive in CapCut's model
@@ -480,6 +499,26 @@ export class CapCutDraft {
     if (riClash) issues.push(`${riClash} overlapping segment pair(s) share a render_index (ambiguous layer order)`);
     else if (ris.size < [...ris.values()].reduce((n, a) => n + a.length, 0)) warnings.push('some non-overlapping segments share a render_index (harmless; CapCut does this for sequential clips)');
     for (const s of (c.materials?.videos || [])) if (s.path && !fs.existsSync(s.path)) issues.push(`missing media file: ${s.path}`);
+    // a keyframe outside its own segment's span never fires -- CapCut just plays a static value,
+    // silently, with no error of its own. addKeyframe() rejects this at write time, but capcut_raw_patch
+    // can still inject one directly, so this is the last line of defense before save().
+    for (const tr of c.tracks) for (const s of (tr.segments || [])) {
+      const localDur = s.target_timerange?.duration;
+      if (localDur == null) continue;
+      for (const list of (s.common_keyframes || [])) for (const kf of (list.keyframe_list || [])) {
+        if (kf.time_offset < 0 || kf.time_offset > localDur) issues.push(`keyframe out of range on segment ${s.id} (${list.property_type}): time_offset=${(kf.time_offset / US).toFixed(3)}s, segment duration=${(localDur / US).toFixed(3)}s`);
+      }
+    }
+    // every extra_material_ref must resolve to a real material -- catches one getting dropped
+    // between being created and being saved (e.g. a fade/filter/mask that silently disappears).
+    for (const tr of c.tracks) for (const s of (tr.segments || [])) for (const id of (s.extra_material_refs || [])) {
+      const [k] = findMat(c, id);
+      if (k === null) issues.push(`segment ${s.id} references material ${id} which does not exist in any materials array`);
+    }
+    for (const s of (c.materials?.audio_fades || [])) {
+      const referenced = c.tracks.some(tr => (tr.segments || []).some(seg => (seg.extra_material_refs || []).includes(s.id)));
+      if (!referenced) warnings.push(`audio_fade material ${s.id} exists but is not referenced by any segment (orphaned)`);
+    }
     return { ok: issues.length === 0, issues, warnings };
   }
 

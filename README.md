@@ -56,6 +56,7 @@ All times at the tool boundary are in **seconds** (converted to CapCut's microse
 | `capcut_add_video / _image / _audio` | place media on a track. Omit `atSec` to append right after the last clip on that track — no running-total math needed for a sequence of clips |
 | `capcut_add_text` | text overlay (needs a text template draft). Omit `atSec` to append too |
 | `capcut_add_track` | new video/audio/text/sticker track |
+| `capcut_set_track_mute` | mute/unmute an entire track — a track cloned from a muted template starts muted with no visible sign of it besides this field |
 | `capcut_move_segment` | change start time / track |
 | `capcut_trim_segment` | change start / duration / source in-point. `ripple:true` shifts every later segment by the resulting time change instead of leaving a gap or overlap (`rippleAllTracks:true` to shift every track, not just this one) |
 | `capcut_split_segment` | split at a time |
@@ -65,7 +66,7 @@ All times at the tool boundary are in **seconds** (converted to CapCut's microse
 | `capcut_add_filter` | attach a real filter (from the catalog) to a segment, with optional intensity |
 | `capcut_add_transition` | attach a real transition on a segment, applied to whatever follows it on the same track |
 | `capcut_add_mask` | attach a mask shape (circle/rectangle/heart/star/linear/mirror) with position/size/feather/rounding |
-| `capcut_add_keyframe` / `capcut_remove_keyframes` | real per-property animation over time (position/scale/rotation/alpha/saturation/contrast/brightness/volume) — not just a static value |
+| `capcut_add_keyframe` / `capcut_remove_keyframes` | real per-property animation over time (position/scale/rotation/alpha/saturation/contrast/brightness/volume) — not just a static value. `atSec` is absolute timeline time like every other tool here; internally converted to CapCut's segment-relative `time_offset`, and rejected with a clear error if it falls outside the segment's own span |
 | `capcut_add_audio_fade` | fade-in/fade-out duration on an audio segment |
 | `capcut_add_sticker` | place a sticker by CapCut `resource_id` (no bundled sticker catalog — see Limitations) |
 | `capcut_undo` | step back up to 20 in-session edits (does not touch anything already saved) |
@@ -94,7 +95,8 @@ Filters, transitions, and masks in real CapCut are **not freely inventable** —
 
 ## Guardrails
 - Won't save while CapCut is open (autosave clobber protection), or if the draft changed on disk since this session loaded it.
-- Won't save a draft `capcut_validate` flags as broken (overlaps, duplicate ids, render_index clashes) unless `force:true`.
+- Won't save a draft `capcut_validate` flags as broken (overlaps, duplicate ids, render_index clashes, out-of-range keyframes, dangling material references) unless `force:true`.
+- `capcut_read_timeline` shows an explicit `warning` when CapCut is open on the draft you're editing.
 - `.mcpbak` backup + atomic temp-then-rename write.
 - New drafts are **cloned from a known-good base**, never built from an empty object.
 - `capcut_undo` steps back through in-session edits (up to 20), independent of the disk.
